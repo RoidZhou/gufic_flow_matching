@@ -1,0 +1,11 @@
+# git ignore file
+# ignore all files in pycache
+__pycache__/
+utils/__pycache__/
+*.pyc
+*.png
+*.tex
+*.pkl
+development/
+gufic_env/Testing_files/
+MUJOCO_LOG.TXT
