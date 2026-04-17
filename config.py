@@ -4,33 +4,35 @@ from dataclasses import dataclass, asdict
 # ============================================================
 # Config
 # ============================================================
-
 @dataclass
-class Config:
-    seed: int = 42
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+class TrainConfig:
+    train_demo_dir: str = "/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos"
+    val_demo_dir: str = "/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos"
+    save_dir: str = "./checkpoints_fm"
 
-    # data
-    dataset_mode: str = "8gaussians"  # choices: 8gaussians, circle
-    dataset_size: int = 20000
-    batch_size: int = 512
+    model: str = "mlp"  # "mlp" or "transformer"
+
+    batch_size: int = 64
+    lr: float = 1e-4
+    weight_decay: float = 1e-5
+    epochs: int = 30
+
+    add_state_noise: bool = True
+    pos_noise_std: float = 0.001
+    ori_noise_std: float = 0.01
+
+    hidden_dim: int = 256
+    num_layers: int = 4
+    time_dim: int = 64
+    cond_dim: int = 6
+
+    # 混合损失权重
+    lambda_vel: float = 1.0
+    lambda_fm: float = 0.2
+    lambda_fm_ori: float = 0.05
 
     # path
     alpha: float = 0.35
     eps: float = 1e-8
-
-    # model
-    hidden_dim: int = 256
-    num_layers: int = 4
-
-    # train
-    lr: float = 1e-3
-    weight_decay: float = 1e-5
-    epochs: int = 300
-    log_interval: int = 20
-
-    # inference / viz
-    rollout_steps: int = 100
-    num_demo_paths: int = 8
-    out_dir: str = "./fm_target_path_outputs"
-    ckpt_name: str = "cfm_target_path.pt"
+    
+    cond_key: str = "fe"

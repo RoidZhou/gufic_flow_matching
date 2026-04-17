@@ -34,14 +34,14 @@ class CurvedPathCFM:
         """
         device = x1.device
         batch = x1.shape[0]
+        seq_len = x1.shape[1]
         x0 = torch.randn_like(x1)
-        t = torch.rand(batch, 1, device=device)
+        t = torch.rand(batch, 1, 1, device=device) # FM 的 flow time t 应该是“每个样本一个标量”，而不是“每个时间步一个不同的标量”。
 
         delta = x1 - x0
-        n = self.normal_unit(delta)
 
-        xt = (1.0 - t) * x0 + t * x1 + self.alpha * torch.sin(math.pi * t) * n
-        ut = delta + self.alpha * math.pi * torch.cos(math.pi * t) * n
+        xt = (1.0 - t) * x0 + t * x1
+        ut = delta
         return x0, x1, t, xt, ut
 
     def teacher_path(self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
