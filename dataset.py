@@ -20,9 +20,10 @@ class FlowMatchingDataset(Dataset):
       t0, t1:   [1], [1]
       dt:       [1]
     """
-    def __init__(self, demo_dir, cond_key="fe"):
+    def __init__(self, demo_dir, cond_key="fe", normalize = True, eps=1e-6):
         self.samples = []
         self.cond_key = cond_key
+        raw_v_list = []
 
         demo_files = sorted(glob.glob(os.path.join(demo_dir, "*.npz")))
         if len(demo_files) == 0:
@@ -43,12 +44,25 @@ class FlowMatchingDataset(Dataset):
                 goal = data["goal"].astype(np.float32)
                 cond = np.repeat(goal[None, :], len(t), axis=0).astype(np.float32)
 
+            raw_v_list.append(v)
             self.samples.append({
                 "x": x,
-                "v": v,
+                "v_raw": v,
                 "fe": cond,
                 "t": np.array([t / max(total_time, 1e-8)], dtype=np.float32),
                 })
+
+        all_v = np.concatenate(raw_v_list, axis=0)      # [sum(T), 6]
+        v_mean = all_v.mean(axis=0, keepdims=True).astype(np.float32)
+        v_std = all_v.std(axis=0, keepdims=True).astype(np.float32)
+        v_std = np.clip(v_std, eps, None)
+        self.stats = {"v_mean": v_mean, "v_std": v_std}
+
+        for s in self.samples:
+            if normalize:
+                s["v"] = ((s["v_raw"] - self.stats["v_mean"]) / self.stats["v_std"]).astype(np.float32)
+            else:
+                s["v"] = s["v_raw"]
 
         print(f"[PairDataset] loaded {len(demo_files)} demos, total pairs = {len(self.samples)}")
 
@@ -63,6 +77,8 @@ class FlowMatchingDataset(Dataset):
             torch.from_numpy(s["fe"]),
             torch.from_numpy(s["t"]),
         )
+    def get_stats(self):
+        return self.stats
     
 class FlowMatchingHybridDataset(Dataset):
     """

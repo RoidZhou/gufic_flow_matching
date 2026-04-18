@@ -29,6 +29,8 @@ def train_velocity_field_mixed(cfg: TrainConfig, path_sampler: CurvedPathCFM):
         demo_dir=cfg.train_demo_dir,
         cond_key=cfg.cond_key,
     )
+    train_stats = train_dataset.get_stats()
+
     val_dataset = FlowMatchingDataset(
         demo_dir=cfg.val_demo_dir,
         cond_key=cfg.cond_key,
@@ -87,13 +89,13 @@ def train_velocity_field_mixed(cfg: TrainConfig, path_sampler: CurvedPathCFM):
         train_sum, train_count = 0.0, 0
 
         for x, v, fe, t in train_loader:
-            x1 = x.to(device).float()
+            # x1 = x.to(device).float()
             v_t = v.to(device).float()
             fe_t = fe.to(device).float()
             t = t.to(device).float()
 
             # 采样 tau
-            _, x1, t, xt, ut = path_sampler.sample_training_tuple(x1)
+            _, x1, t, xt, ut = path_sampler.sample_training_tuple(v_t)
 
             # 模型预测
             pred = model(xt, t, x1)            # [B,6]
@@ -117,12 +119,12 @@ def train_velocity_field_mixed(cfg: TrainConfig, path_sampler: CurvedPathCFM):
         val_sum, val_count = 0.0, 0
         with torch.no_grad():
             for x, v, fe, t in val_loader:
-                x1 = x.to(device).float()
+                # x1 = x.to(device).float()
                 v_t = v.to(device).float()
                 fe_t = fe.to(device).float()
                 t = t.to(device).float()
 
-                _, x1, t, xt, ut = path_sampler.sample_training_tuple(x1)
+                _, x1, t, xt, ut = path_sampler.sample_training_tuple(v_t)
 
                 pred = model(xt, t, x1)
                 loss = F.mse_loss(pred, ut)
@@ -139,8 +141,9 @@ def train_velocity_field_mixed(cfg: TrainConfig, path_sampler: CurvedPathCFM):
             torch.save(
                 {
                     "model": model.state_dict(),
-                    "config": cfg.__dict__,
+                    "train_cfg": cfg.__dict__,
                     "best_loss": best_loss,
+                    "stats": train_stats,
                 },
                 os.path.join(cfg.save_dir, "fm_best.pt"),
             )
@@ -164,7 +167,7 @@ def train_velocity_field_mixed(cfg: TrainConfig, path_sampler: CurvedPathCFM):
 
 
 if __name__ == "__main__":
-    cfg = TrainConfig(epochs=1000, batch_size=128, save_dir="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm")
+    cfg = TrainConfig(epochs=1000, batch_size=8, save_dir="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm")
     path_sampler = CurvedPathCFM(alpha=cfg.alpha, eps=cfg.eps)
 
     train_velocity_field_mixed(cfg, path_sampler)

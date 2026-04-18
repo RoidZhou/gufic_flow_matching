@@ -10,7 +10,7 @@ class TrainConfig:
     val_demo_dir: str = "/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos"
     save_dir: str = "./checkpoints_fm"
 
-    model: str = "mlp"  # "mlp" or "transformer"
+    model: str = "transformer"  # "mlp" or "transformer"
 
     batch_size: int = 64
     lr: float = 1e-4

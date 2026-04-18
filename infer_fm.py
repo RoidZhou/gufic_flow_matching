@@ -5,24 +5,44 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 
-from model import VelocityFMMLP, TimeEmbedding, VelocityFMTransformer
+from model import VelocityFMMLP, VelocityFMTransformer
 from config import TrainConfig
 
 
 # ============================================================
-# Load checkpoint
+# Config / checkpoint loading
 # ============================================================
 
-def load_model(ckpt_path, cfg, device="cuda"):
+def build_cfg_from_ckpt(ckpt_config: dict):
+    """
+    用 checkpoint 里的配置覆盖 TrainConfig 默认值
+    """
+    cfg = TrainConfig()
+    if ckpt_config is not None:
+        for k, v in ckpt_config.items():
+            try:
+                setattr(cfg, k, v)
+            except Exception:
+                pass
+    return cfg
+
+
+def load_model(ckpt_path, device="cuda"):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    if cfg.model == "transformer":
+
+    ckpt_cfg = ckpt.get("config", {})
+    cfg = build_cfg_from_ckpt(ckpt_cfg)
+
+    model_name = getattr(cfg, "model", "mlp")
+
+    if model_name == "transformer":
         model = VelocityFMTransformer(
             x_dim=6,
             cond_dim=cfg.cond_dim,
             time_dim=cfg.time_dim,
             hidden_dim=cfg.hidden_dim,
             num_layers=cfg.num_layers,
-            use_cond=False
+            use_cond=False,
         ).to(device)
     else:
         model = VelocityFMMLP(
@@ -31,162 +51,187 @@ def load_model(ckpt_path, cfg, device="cuda"):
             time_dim=cfg.time_dim,
             hidden_dim=cfg.hidden_dim,
             num_layers=cfg.num_layers,
-            use_cond=False
+            use_cond=False,
         ).to(device)
 
     model.load_state_dict(ckpt["model"])
     model.eval()
-    return model, cfg, ckpt
+
+    stats = ckpt.get("stats", None)
+    if stats is None:
+        raise ValueError("Checkpoint 中没有找到 stats，请先在训练保存时把 v_mean / v_std 一起存进去。")
+
+    if "v_mean" not in stats or "v_std" not in stats:
+        raise ValueError("stats 里必须包含 'v_mean' 和 'v_std'。")
+
+    return model, cfg, ckpt, stats
+
+
+# ============================================================
+# Normalization helpers
+# 只对 v 做归一化 / 反归一化
+# ============================================================
+
+def normalize_v(v, stats):
+    return (v - stats["v_mean"]) / stats["v_std"]
+
+
+def denormalize_v(v, stats):
+    return v * stats["v_std"] + stats["v_mean"]
 
 
 # ============================================================
 # Demo loading
+# 主对象统一成 Vd_star
 # ============================================================
 
 def load_one_demo(npz_path):
     data = np.load(npz_path)
     demo = {
-        "x": data["x"].astype(np.float32),                    # [T,6]
-        "t": data["t"].astype(np.float32),                    # [T]
+        "v": data["Vd_star"].astype(np.float32),      # [T, 6]
+        "t": data["t"].astype(np.float32),            # [T]
         "total_time": float(data["total_time"][0]),
     }
-    if "Vd_star" in data:
-        demo["Vd_star"] = data["Vd_star"].astype(np.float32)  # [T,6]
     return demo
 
 
 # ============================================================
-# Modified infer: generate 10000 samples from noise
+# Unconditional FM sampling
+# 生成的是速度轨迹样本 v，而不是状态 x
 # ============================================================
 
 @torch.no_grad()
 def sample_velocity_trajectory(
     model,
-    x_query,
-    t_query,
-    x1,
+    traj_len,
+    stats,
     device="cuda",
     steps=100,
     return_history=True,
+    seed=None,
 ):
     """
-    按你当前修改后的推理逻辑：
-      - 初始 x_t 是高斯噪声
-      - 迭代 steps 次
-      - 每一步都用 model(x_t, t) 预测速度
-      - Euler 更新 x_t = x_t + v_pred * dt
+    无条件 FM 采样：
+      v_t ~ N(0, I)
+      u_pred = model(v_t, t)
+      v_t <- v_t + u_pred * dt
 
-    注意：
-      这里 x_query / t_query / x1 主要只用来确定样本个数和做后续对比；
-      当前生成过程本身并没有真正使用 x_query / x1 条件。
+    这里:
+      - v_t 是当前生成中的“速度轨迹样本”
+      - u_pred 是 FM 的流速度（normalized space）
+      - 最终生成结果是 v_sample_final，而不是 u_final
+
+    Args:
+      traj_len:      轨迹长度 T
+      stats:         {"v_mean": ..., "v_std": ...}
+      steps:         ODE 采样步数
+      return_history:是否返回采样历史
+      seed:          随机种子，可选
 
     Returns:
       result = {
-        "x_final":   [N,6],
-        "v_final":   [N,6],
-        "x_history": [steps, N, 6] or None,
-        "v_history": [steps, N, 6] or None,
-        "step_t":    [steps]
+        "v_sample_final":      [T, 6]   # 反归一化后的最终生成速度轨迹
+        "v_sample_final_norm": [T, 6]   # 归一化空间里的最终轨迹
+        "u_final_norm":        [T, 6]   # 最后一步模型输出（flow velocity）
+        "v_sample_history":    [steps+1, T, 6] or None   # 反归一化后的历史
+        "v_sample_history_norm":[steps+1, T, 6] or None  # 归一化空间里的历史
+        "u_history_norm":      [steps, T, 6] or None
+        "step_t":              [steps+1]
       }
     """
-    x_query = np.asarray(x_query, dtype=np.float32)
-    N = x_query.shape[0]
+    if seed is not None:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
     dt = 1.0 / steps
 
-    # 初始噪声
-    x_t = torch.randn(1, N, 6, device=device)
+    # 初始噪声：速度轨迹样本（normalized space）
+    v_t = torch.randn(1, traj_len, 6, device=device)
 
-    x_history = []
-    v_history = []
+    v_sample_history_norm = []
+    u_history_norm = []
     step_t = []
 
+    if return_history:
+        v_sample_history_norm.append(v_t.squeeze(0).detach().cpu().numpy().copy())
+        step_t.append(0.0)
+
     for i in range(steps):
+        # flow time，对整条轨迹共用一个标量
         t_value = torch.full(
-            (x_t.shape[0], x_t.shape[1], 1),
+            (1, 1, 1),
             i / steps,
-            device=x_t.device,
-            dtype=x_t.dtype
+            device=v_t.device,
+            dtype=v_t.dtype
         )
 
-        v_pred = model(x_t=x_t, t=t_value)   # [1, N, 6]
+        # 模型输出的是 normalized space 里的 flow velocity
+        u_pred = model(x_t=v_t, t=t_value)   # [1, T, 6]
 
         if return_history:
-            x_history.append(x_t.squeeze(0).detach().cpu().numpy().copy())
-            v_history.append(v_pred.squeeze(0).detach().cpu().numpy().copy())
-            step_t.append(i / steps)
+            u_history_norm.append(u_pred.squeeze(0).detach().cpu().numpy().copy())
 
         # Euler 更新
-        x_t = x_t + v_pred * dt
+        v_t = v_t + u_pred * dt
 
-    x_final = x_t.squeeze(0).detach().cpu().numpy().astype(np.float32)   # [N,6]
-    v_final = v_pred.squeeze(0).detach().cpu().numpy().astype(np.float32)  # [N,6]
+        if return_history:
+            v_sample_history_norm.append(v_t.squeeze(0).detach().cpu().numpy().copy())
+            step_t.append((i + 1) / steps)
+
+    v_sample_final_norm = v_t.squeeze(0).detach().cpu().numpy().astype(np.float32)   # [T,6]
+    u_final_norm = u_pred.squeeze(0).detach().cpu().numpy().astype(np.float32)        # [T,6]
+
+    # 只对 v 做反归一化
+    v_sample_final = denormalize_v(v_sample_final_norm, stats).astype(np.float32)
+
+    if return_history:
+        v_sample_history_norm = np.stack(v_sample_history_norm, axis=0).astype(np.float32)  # [steps+1, T, 6]
+        v_sample_history = denormalize_v(v_sample_history_norm, stats).astype(np.float32)
+        u_history_norm = np.stack(u_history_norm, axis=0).astype(np.float32)               # [steps, T, 6]
+        step_t = np.array(step_t, dtype=np.float32)
+    else:
+        v_sample_history_norm = None
+        v_sample_history = None
+        u_history_norm = None
+        step_t = None
 
     result = {
-        "x_final": x_final,
-        "v_final": v_final,
-        "x_history": np.stack(x_history, axis=0).astype(np.float32) if return_history else None,  # [steps,N,6]
-        "v_history": np.stack(v_history, axis=0).astype(np.float32) if return_history else None,  # [steps,N,6]
-        "step_t": np.array(step_t, dtype=np.float32) if return_history else None,
+        "v_sample_final": v_sample_final,
+        "v_sample_final_norm": v_sample_final_norm,
+        "u_final_norm": u_final_norm,
+        "v_sample_history": v_sample_history,
+        "v_sample_history_norm": v_sample_history_norm,
+        "u_history_norm": u_history_norm,
+        "step_t": step_t,
     }
     return result
 
 
 # ============================================================
 # Visualization helpers
+# 全部围绕 v / Vd_star
 # ============================================================
-
-def plot_generated_state_components(x_pred, x_gt=None, save_path=None):
-    """
-    横轴 = sample index
-    """
-    sample_idx = np.arange(len(x_pred))
-    labels = ["px", "py", "pz", "rx", "ry", "rz"]
-
-    fig, axes = plt.subplots(6, 1, figsize=(10, 13), sharex=True)
-
-    for i in range(6):
-        if x_gt is not None and len(x_gt) == len(x_pred):
-            axes[i].plot(sample_idx, x_gt[:, i], "--", linewidth=1.5, label="teacher")
-        axes[i].plot(sample_idx, x_pred[:, i], linewidth=1.5, label="generated")
-        axes[i].set_ylabel(labels[i])
-        axes[i].grid(alpha=0.3)
-        if i == 0:
-            axes[i].legend()
-
-    axes[-1].set_xlabel("sample index")
-    fig.suptitle("Generated State Components")
-    plt.tight_layout()
-
-    if save_path is not None:
-        plt.savefig(save_path, dpi=180)
-        plt.close()
-    else:
-        plt.show()
-
 
 def plot_generated_velocity_components(v_pred, v_gt=None, save_path=None):
     """
-    横轴 = sample index
-    注意：如果 v_gt 存在，这里只是“按索引粗对齐”的比较，
-    不代表严格的一一对应。
+    横轴 = trajectory step index
     """
-    sample_idx = np.arange(len(v_pred))
+    step_idx = np.arange(len(v_pred))
     labels = ["vx", "vy", "vz", "wx", "wy", "wz"]
 
     fig, axes = plt.subplots(6, 1, figsize=(10, 13), sharex=True)
 
     for i in range(6):
         if v_gt is not None and len(v_gt) == len(v_pred):
-            axes[i].plot(sample_idx, v_gt[:, i], "--", linewidth=1.5, label="teacher")
-        axes[i].plot(sample_idx, v_pred[:, i], linewidth=1.5, label="generated")
+            axes[i].plot(step_idx, v_gt[:, i], "--", linewidth=1.5, label="teacher")
+        axes[i].plot(step_idx, v_pred[:, i], linewidth=1.5, label="generated")
         axes[i].set_ylabel(labels[i])
         axes[i].grid(alpha=0.3)
         if i == 0:
             axes[i].legend()
 
-    axes[-1].set_xlabel("sample index")
-    fig.suptitle("Generated Velocity Components")
+    axes[-1].set_xlabel("trajectory step")
+    fig.suptitle("Generated Velocity Trajectory Components")
     plt.tight_layout()
 
     if save_path is not None:
@@ -198,19 +243,21 @@ def plot_generated_velocity_components(v_pred, v_gt=None, save_path=None):
 
 def plot_generated_velocity_error(v_pred, v_gt, save_path=None):
     """
-    仅当样本数一致时做一个“粗对齐误差”
+    注意：
+      这只是在“单条生成轨迹 vs 单条 demo 轨迹”上的逐点误差。
+      对无条件 FM，这只是参考，不是最核心指标。
     """
     if v_gt is None or len(v_gt) != len(v_pred):
         return
 
-    sample_idx = np.arange(len(v_pred))
+    step_idx = np.arange(len(v_pred))
     err = np.linalg.norm(v_pred - v_gt, axis=1)
 
     plt.figure(figsize=(8, 4))
-    plt.plot(sample_idx, err, linewidth=1.5)
-    plt.xlabel("sample index")
+    plt.plot(step_idx, err, linewidth=1.5)
+    plt.xlabel("trajectory step")
     plt.ylabel("||v_pred - v_teacher||")
-    plt.title("Generated Velocity Error (index-wise rough comparison)")
+    plt.title("Velocity Trajectory Error")
     plt.grid(alpha=0.3)
     plt.tight_layout()
 
@@ -258,28 +305,28 @@ def plot_velocity_norm_hist(v_pred, v_gt=None, save_path=None):
         plt.show()
 
 
-def plot_generated_state_scatter_3d(x_pred, x_gt=None, save_path=None):
+def plot_generated_linear_velocity_scatter_3d(v_pred, v_gt=None, save_path=None):
     """
-    生成状态点云（只看位置前三维）
+    3D 线速度点云：(vx, vy, vz)
     """
     fig = plt.figure(figsize=(8, 7))
     ax = fig.add_subplot(111, projection="3d")
 
     ax.scatter(
-        x_pred[:, 0], x_pred[:, 1], x_pred[:, 2],
+        v_pred[:, 0], v_pred[:, 1], v_pred[:, 2],
         s=3, alpha=0.7, label="generated"
     )
 
-    if x_gt is not None:
+    if v_gt is not None:
         ax.scatter(
-            x_gt[:, 0], x_gt[:, 1], x_gt[:, 2],
+            v_gt[:, 0], v_gt[:, 1], v_gt[:, 2],
             s=2, alpha=0.3, label="teacher"
         )
 
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_zlabel("z")
-    ax.set_title("Generated 3D State Samples")
+    ax.set_xlabel("vx")
+    ax.set_ylabel("vy")
+    ax.set_zlabel("vz")
+    ax.set_title("Generated Linear Velocity Samples")
     ax.legend()
     plt.tight_layout()
 
@@ -290,16 +337,17 @@ def plot_generated_state_scatter_3d(x_pred, x_gt=None, save_path=None):
         plt.show()
 
 
-def plot_generation_progress(step_t, v_history, save_path=None):
+def plot_generation_progress(step_t, v_sample_history, save_path=None):
     """
-    看整个生成过程中速度模长怎么变化
+    看整个生成过程中，生成出来的速度轨迹样本模长怎么变化
+    这里用的是“生成样本本身”，不是 u_pred
     """
-    if step_t is None or v_history is None:
+    if step_t is None or v_sample_history is None:
         return
 
-    # v_history: [steps, N, 6]
-    lin_norm = np.linalg.norm(v_history[:, :, :3], axis=2)   # [steps, N]
-    ang_norm = np.linalg.norm(v_history[:, :, 3:6], axis=2)  # [steps, N]
+    # v_sample_history: [steps+1, T, 6]
+    lin_norm = np.linalg.norm(v_sample_history[:, :, :3], axis=2)   # [steps+1, T]
+    ang_norm = np.linalg.norm(v_sample_history[:, :, 3:6], axis=2)  # [steps+1, T]
 
     mean_lin = lin_norm.mean(axis=1)
     std_lin = lin_norm.std(axis=1)
@@ -318,7 +366,7 @@ def plot_generation_progress(step_t, v_history, save_path=None):
     axes[1].plot(step_t, mean_ang, linewidth=2, label="mean angular norm")
     axes[1].fill_between(step_t, mean_ang - std_ang, mean_ang + std_ang, alpha=0.2)
     axes[1].set_ylabel("||w||")
-    axes[1].set_xlabel("generation step time")
+    axes[1].set_xlabel("generation time")
     axes[1].set_title("Generation Progress: Angular Velocity Norm")
     axes[1].grid(alpha=0.3)
 
@@ -337,134 +385,125 @@ def plot_generation_progress(step_t, v_history, save_path=None):
 def run_direct_field_inference(
     ckpt_path,
     demo_path,
-    out_dir="./fm_field_query_vis",
+    out_dir="./infer_fm",
     max_points=10000,
+    steps=100,
+    seed=None,
 ):
     os.makedirs(out_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg = TrainConfig()
 
-    model, cfg, ckpt = load_model(ckpt_path, cfg, device=device)
+    model, cfg, ckpt, stats = load_model(ckpt_path, device=device)
+
     demo = load_one_demo(demo_path)
+    v_gt = demo["v"]
 
-    x = demo["x"]
-    t = demo["t"] / max(demo["total_time"], 1e-8)   # 仍然保留，方便统计/对照
-    x1 = x[-1]
+    if len(v_gt) > max_points:
+        idx = np.linspace(0, len(v_gt) - 1, max_points).astype(int)
+        v_gt = v_gt[idx]
 
-    if len(x) > max_points:
-        idx = np.linspace(0, len(x) - 1, max_points).astype(int)
-        x_query = x[idx]
-        t_query = t[idx]
-        v_gt = demo["Vd_star"][idx] if "Vd_star" in demo else None
-    else:
-        x_query = x
-        t_query = t
-        v_gt = demo["Vd_star"] if "Vd_star" in demo else None
+    traj_len = len(v_gt)
 
     # ========================================================
-    # 生成式推理
+    # 无条件 FM 速度轨迹采样
     # ========================================================
     result = sample_velocity_trajectory(
         model=model,
-        x_query=x_query,
-        t_query=t_query,
-        x1=x1,
+        traj_len=traj_len,
+        stats=stats,
         device=device,
-        steps=100,
+        steps=steps,
         return_history=True,
+        seed=seed,
     )
 
-    x_pred = result["x_final"]          # [N,6]
-    v_pred = result["v_final"]          # [N,6]
-    x_history = result["x_history"]     # [steps,N,6]
-    v_history = result["v_history"]     # [steps,N,6]
-    step_t = result["step_t"]           # [steps]
+    v_sample_pred = result["v_sample_final"]          # [T,6]，真正的生成结果（反归一化后）
+    v_sample_pred_norm = result["v_sample_final_norm"]
+    u_final_norm = result["u_final_norm"]             # 最后一步 flow velocity（normalized space）
+    v_sample_history = result["v_sample_history"]     # [steps+1, T, 6]（反归一化后）
+    v_sample_history_norm = result["v_sample_history_norm"]
+    u_history_norm = result["u_history_norm"]
+    step_t = result["step_t"]
 
-    print("==== Direct Field Inference (Modified Form) ====")
-    print(f"num generated samples : {len(x_pred)}")
-    print(f"target x1             : {x1}")
+    print("==== Unconditional FM Velocity Generation ====")
+    print(f"generated traj len : {len(v_sample_pred)}")
 
-    if v_gt is not None and len(v_gt) == len(v_pred):
-        mse = np.mean((v_pred - v_gt) ** 2)
-        mae = np.mean(np.abs(v_pred - v_gt))
-        err_norm = np.linalg.norm(v_pred - v_gt, axis=1)
+    # 注意：这是单条生成轨迹 vs 单条 demo 的参考误差
+    if v_gt is not None and len(v_gt) == len(v_sample_pred):
+        mse = np.mean((v_sample_pred - v_gt) ** 2)
+        mae = np.mean(np.abs(v_sample_pred - v_gt))
+        err_norm = np.linalg.norm(v_sample_pred - v_gt, axis=1)
 
-        print(f"velocity MSE (rough index match) : {mse:.6f}")
-        print(f"velocity MAE (rough index match) : {mae:.6f}")
-        print(f"mean ||error||                   : {err_norm.mean():.6f}")
-        print(f"max  ||error||                   : {err_norm.max():.6f}")
+        print(f"velocity MSE   : {mse:.6f}")
+        print(f"velocity MAE   : {mae:.6f}")
+        print(f"mean ||error|| : {err_norm.mean():.6f}")
+        print(f"max  ||error|| : {err_norm.max():.6f}")
     else:
-        print("No aligned v_gt for strict point-wise comparison.")
+        print("No aligned v_gt for point-wise comparison.")
 
     np.savez_compressed(
-        os.path.join(out_dir, "predicted_velocity_field.npz"),
-        x_query=x_query,
-        t_query=t_query,
-        x1=x1,
-        x_pred=x_pred,
-        v_pred=v_pred,
-        v_gt=v_gt if v_gt is not None else np.zeros_like(v_pred),
+        os.path.join(out_dir, "generated_velocity_trajectory.npz"),
+        v_pred=v_sample_pred,
+        v_pred_norm=v_sample_pred_norm,
+        v_gt=v_gt if v_gt is not None else np.zeros_like(v_sample_pred),
         step_t=step_t,
+        v_mean=stats["v_mean"],
+        v_std=stats["v_std"],
     )
 
     # --------------------------------------------------------
-    # 适配你当前修改推理形式的新可视化
+    # Visualization
     # --------------------------------------------------------
-    plot_generated_state_components(
-        x_pred,
-        x_gt=x_query if len(x_query) == len(x_pred) else None,
-        save_path=os.path.join(out_dir, "generated_state_components.png"),
-    )
-
     plot_generated_velocity_components(
-        v_pred,
-        v_gt=v_gt if (v_gt is not None and len(v_gt) == len(v_pred)) else None,
+        v_sample_pred,
+        v_gt=v_gt if (v_gt is not None and len(v_gt) == len(v_sample_pred)) else None,
         save_path=os.path.join(out_dir, "generated_velocity_components.png"),
     )
 
-    if v_gt is not None and len(v_gt) == len(v_pred):
+    if v_gt is not None and len(v_gt) == len(v_sample_pred):
         plot_generated_velocity_error(
-            v_pred,
+            v_sample_pred,
             v_gt,
             save_path=os.path.join(out_dir, "generated_velocity_error.png"),
         )
 
     plot_velocity_norm_hist(
-        v_pred,
-        v_gt=v_gt if (v_gt is not None and len(v_gt) == len(v_pred)) else None,
+        v_sample_pred,
+        v_gt=v_gt if (v_gt is not None and len(v_gt) == len(v_sample_pred)) else None,
         save_path=os.path.join(out_dir, "velocity_norm_hist.png"),
     )
 
-    plot_generated_state_scatter_3d(
-        x_pred,
-        x_gt=x_query if len(x_query) == len(x_pred) else None,
-        save_path=os.path.join(out_dir, "generated_state_scatter_3d.png"),
+    plot_generated_linear_velocity_scatter_3d(
+        v_sample_pred,
+        v_gt=v_gt if (v_gt is not None and len(v_gt) == len(v_sample_pred)) else None,
+        save_path=os.path.join(out_dir, "generated_linear_velocity_scatter_3d.png"),
     )
 
     plot_generation_progress(
         step_t,
-        v_history,
+        v_sample_history,
         save_path=os.path.join(out_dir, "generation_progress.png"),
     )
 
     print(f"Saved to: {out_dir}")
     return {
-        "x_query": x_query,
-        "t_query": t_query,
-        "x1": x1,
-        "x_pred": x_pred,
-        "v_pred": v_pred,
         "v_gt": v_gt,
-        "x_history": x_history,
-        "v_history": v_history,
+        "v_sample_pred": v_sample_pred,
+        "v_sample_pred_norm": v_sample_pred_norm,
+        "u_final_norm": u_final_norm,
+        "v_sample_history": v_sample_history,
+        "v_sample_history_norm": v_sample_history_norm,
+        "u_history_norm": u_history_norm,
         "step_t": step_t,
     }
 
 
 if __name__ == "__main__":
     run_direct_field_inference(
-        ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/checkpoints_fm/fm_best.pt",
+        ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm/fm_best.pt",
         demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos/bolt_demo_0000.npz",
         out_dir="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_fm",
         max_points=10000,
+        steps=100,
+        seed=42,
     )
