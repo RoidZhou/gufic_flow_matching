@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from dataset import FlowMatchingDataset
-from model import VelocityFMMLP, VelocityFMTransformer
+from model import VelocityFMMLP, VelocityFMTransformer,VelocityFMCondUnet1D
 from config import TrainConfig
 from cfm import CurvedPathCFM
 
@@ -57,6 +57,13 @@ def train_velocity_field_mixed(cfg: TrainConfig, path_sampler: CurvedPathCFM):
             time_dim=cfg.time_dim,
             hidden_dim=cfg.hidden_dim,
             num_layers=cfg.num_layers,
+            use_cond=False
+        ).to(device)
+    elif cfg.model == "unet":
+        model = VelocityFMCondUnet1D(
+            x_dim=6,
+            cond_dim=cfg.cond_dim,
+            time_dim=cfg.time_dim,
             use_cond=False
         ).to(device)
     else:
@@ -167,7 +174,11 @@ def train_velocity_field_mixed(cfg: TrainConfig, path_sampler: CurvedPathCFM):
 
 
 if __name__ == "__main__":
-    cfg = TrainConfig(epochs=1000, batch_size=8, save_dir="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm")
+    cfg = TrainConfig(train_demo_dir="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos_random_start",
+                        val_demo_dir="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos_random_start",
+                        epochs=1000, 
+                        batch_size=8, 
+                        save_dir="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_random_start")
     path_sampler = CurvedPathCFM(alpha=cfg.alpha, eps=cfg.eps)
 
     train_velocity_field_mixed(cfg, path_sampler)

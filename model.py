@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import math
+from gufic_env.flow_matching.diffusion_model.diffusion.conditional_unet1d import ConditionalUnet1D
 
 # ============================================================
 # Model
@@ -248,4 +249,61 @@ class VelocityFMTransformer(nn.Module):
         if squeeze_back:
             out = out.squeeze(1)                      # 回到 [B, x_dim]
 
+        return out
+
+# ============================================================
+# Flow Matching Conditional Unet1D version
+# 输入:
+#   x_t: [B, T, x_dim]
+#   t:   [B, 1] 或 [B, T, 1]
+#   fe:  [B, T, cond_dim] 或 [B, cond_dim] 或 None
+# 输出:
+#   v:   [B, T, x_dim]
+# ============================================================
+class VelocityFMCondUnet1D(nn.Module):
+    def __init__(self, x_dim=6, cond_dim=6, time_dim=64, kernel_size=5, use_cond=True):
+        super().__init__()
+        self.x_dim = x_dim
+        self.use_cond = use_cond
+        if self.use_cond:
+            in_dim = x_dim + cond_dim
+        else:
+            in_dim = x_dim
+
+        self.unet = ConditionalUnet1D(
+            input_dim=in_dim,
+            global_cond_dim=x_dim,
+            diffusion_step_embed_dim=time_dim,
+            kernel_size=kernel_size,
+            use_down_condition=False,
+            use_mid_condition=False,
+            use_up_condition=False,
+        )
+
+    def forward(self, x_t, t, fe=None):
+        B, T, _ = x_t.shape
+
+        # 处理 t
+        t = t.squeeze()
+        t_emb = t   # [B, T, time_dim]
+
+        # 处理条件 fe
+        if self.use_cond:
+            if fe is None:
+                raise ValueError("use_cond=True 时, fe 不能为 None")
+
+            if fe.dim() == 2:
+                fe = fe.unsqueeze(1).expand(B, T, fe.shape[-1])   # [B, T, cond_dim]
+            elif fe.dim() == 3:
+                if fe.shape[1] == 1:
+                    fe = fe.expand(B, T, fe.shape[-1])
+            else:
+                raise ValueError(f"Unexpected fe shape: {fe.shape}")
+
+            h = torch.cat([x_t, fe], dim=-1)   # [B, T, in_dim]
+        else:
+            h = x_t
+
+        out = self.unet(h, t_emb)   # [B, T, x_dim]
+        
         return out

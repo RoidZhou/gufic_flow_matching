@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 
-from model import VelocityFMMLP, VelocityFMTransformer
+from model import VelocityFMMLP, VelocityFMTransformer, VelocityFMCondUnet1D
 from config import TrainConfig
 
 
@@ -43,6 +43,13 @@ def load_model(ckpt_path, device="cuda"):
             hidden_dim=cfg.hidden_dim,
             num_layers=cfg.num_layers,
             use_cond=False,
+        ).to(device)
+    elif model_name == "unet":
+        model = VelocityFMCondUnet1D(
+            x_dim=6,
+            cond_dim=cfg.cond_dim,
+            time_dim=cfg.time_dim,
+            use_cond=False
         ).to(device)
     else:
         model = VelocityFMMLP(
@@ -500,7 +507,7 @@ def run_direct_field_inference(
 
 if __name__ == "__main__":
     run_direct_field_inference(
-        ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm/fm_best.pt",
+        ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_random_start/fm_best.pt",
         demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos/bolt_demo_0000.npz",
         out_dir="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_fm",
         max_points=10000,
