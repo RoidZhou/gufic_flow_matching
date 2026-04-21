@@ -281,29 +281,34 @@ class VelocityFMCondUnet1D(nn.Module):
         )
 
     def forward(self, x_t, t, fe=None):
-        B, T, _ = x_t.shape
+        """
+        x_t: [B, T, x_dim]
+        t:   [B,1,1] 或 [B,1] 或 [B]
+        fe:  [B, T, cond_dim] 或 None
+        """
+        if t.dim() == 3:
+            t_scalar = t[:, 0, 0]   # [B]
+        elif t.dim() == 2:
+            t_scalar = t[:, 0]
+        elif t.dim() == 1:
+            t_scalar = t
+        else:
+            raise ValueError(f"Unexpected t shape: {t.shape}")
 
-        # 处理 t
-        t = t.squeeze()
-        t_emb = t   # [B, T, time_dim]
-
-        # 处理条件 fe
         if self.use_cond:
             if fe is None:
-                raise ValueError("use_cond=True 时, fe 不能为 None")
-
-            if fe.dim() == 2:
-                fe = fe.unsqueeze(1).expand(B, T, fe.shape[-1])   # [B, T, cond_dim]
-            elif fe.dim() == 3:
-                if fe.shape[1] == 1:
-                    fe = fe.expand(B, T, fe.shape[-1])
-            else:
-                raise ValueError(f"Unexpected fe shape: {fe.shape}")
-
-            h = torch.cat([x_t, fe], dim=-1)   # [B, T, in_dim]
+                raise ValueError("use_cond=True 时 fe 不能为 None")
+            out = self.unet(
+                sample=x_t,
+                timestep=t_scalar,
+                local_cond=fe,
+                global_cond=None,
+            )
         else:
-            h = x_t
-
-        out = self.unet(h, t_emb)   # [B, T, x_dim]
-        
+            out = self.unet(
+                sample=x_t,
+                timestep=t_scalar,
+                local_cond=None,
+                global_cond=None,
+            )
         return out

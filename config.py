@@ -10,7 +10,8 @@ class TrainConfig:
     val_demo_dir: str = "/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos"
     save_dir: str = "./checkpoints_fm"
 
-    model: str = "transformer"  # "mlp" or "transformer"
+    train_mode: str = "rolling_horizon"  # "fixed_length" or "rolling_horizon"
+    model: str = "transformer"  # "mlp" or "transformer" or "unet"
 
     batch_size: int = 64
     lr: float = 1e-4
@@ -26,6 +27,16 @@ class TrainConfig:
     time_dim: int = 64
     cond_dim: int = 6
 
+    # 条件 = 最近 K 步力序列，展平后维度 = 6*K
+    force_hist_len: int = 16
+    cond_dim: int = 6 * 16
+
+    # 未来预测 horizon
+    pred_horizon: int = 100
+
+    # 采样步长
+    stride: int = 5
+
     # 混合损失权重
     lambda_vel: float = 1.0
     lambda_fm: float = 0.2
@@ -34,5 +45,5 @@ class TrainConfig:
     # path
     alpha: float = 0.35
     eps: float = 1e-8
-    
+    use_cond: bool = True
     cond_key: str = "fe"

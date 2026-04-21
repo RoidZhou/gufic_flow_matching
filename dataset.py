@@ -79,7 +79,112 @@ class FlowMatchingDataset(Dataset):
         )
     def get_stats(self):
         return self.stats
-    
+
+class RollingForceHistoryFMDataset(Dataset):
+    """
+    每个样本:
+      fe_hist:  [K, 6]
+      v_future: [H, 6]
+
+    训练目标:
+      用最近 K 步力序列作为条件，生成未来 H 步速度场
+    """
+    def __init__(
+        self,
+        demo_dir,
+        force_hist_len=16,
+        pred_horizon=100,
+        stride=5,
+        normalize_v=True,
+        v_stats=None,
+        eps=1e-6,
+    ):
+        self.samples = []
+        self.force_hist_len = force_hist_len
+        self.pred_horizon = pred_horizon
+        self.normalize_v = normalize_v
+        self.eps = eps
+
+        demo_files = sorted(glob.glob(os.path.join(demo_dir, "*.npz")))
+        if len(demo_files) == 0:
+            raise ValueError(f"No demo files found in {demo_dir}")
+
+        all_v = []
+
+        for f in demo_files:
+            data = np.load(f)
+
+            if "Vd_star" not in data:
+                raise ValueError(f"Vd_star not found in {f}")
+            if "Fe" not in data:
+                raise ValueError(f"Fe not found in {f}")
+
+            v = data["Vd_star"].astype(np.float32)   # [T,6]
+            fe = data["Fe"].astype(np.float32)       # [T,6]
+
+            T = len(v)
+            all_v.append(v)
+
+            # 需要至少有 K 步历史 + H 步未来
+            start_k = force_hist_len - 1
+            end_k = T - pred_horizon - 1
+
+            for k in range(start_k, end_k + 1, stride):
+                fe_hist = fe[k - force_hist_len + 1 : k + 1]      # [K,6]
+                v_future = v[k + 1 : k + 1 + pred_horizon]        # [H,6]
+
+                self.samples.append({
+                    "fe_hist": fe_hist,
+                    "v_future_raw": v_future,
+                })
+
+        if len(self.samples) == 0:
+            raise ValueError("No valid rolling-horizon samples found.")
+
+        # 只对 v 做标准化
+        if v_stats is None:
+            all_v_cat = np.concatenate(all_v, axis=0)  # [sum(T), 6]
+            v_mean = all_v_cat.mean(axis=0, keepdims=True).astype(np.float32)
+            v_std = all_v_cat.std(axis=0, keepdims=True).astype(np.float32)
+            v_std = np.clip(v_std, eps, None)
+            self.v_stats = {
+                "v_mean": v_mean,
+                "v_std": v_std,
+            }
+        else:
+            self.v_stats = {
+                "v_mean": v_stats["v_mean"].astype(np.float32),
+                "v_std": np.clip(v_stats["v_std"].astype(np.float32), eps, None),
+            }
+
+        for s in self.samples:
+            if normalize_v:
+                s["v_future"] = (
+                    (s["v_future_raw"] - self.v_stats["v_mean"]) / self.v_stats["v_std"]
+                ).astype(np.float32)
+            else:
+                s["v_future"] = s["v_future_raw"].astype(np.float32)
+
+        print(f"[RollingForceHistoryFMDataset] samples = {len(self.samples)}")
+        print(f"[RollingForceHistoryFMDataset] K = {force_hist_len}, H = {pred_horizon}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+
+        fe_hist = s["fe_hist"]                    # [K,6]
+        fe_hist_flat = fe_hist.reshape(-1)        # [6K]
+
+        return (
+            torch.from_numpy(fe_hist_flat.astype(np.float32)),   # [6K]
+            torch.from_numpy(s["v_future"].astype(np.float32)),  # [H,6]
+        )
+
+    def get_v_stats(self):
+        return self.v_stats
+
 class FlowMatchingHybridDataset(Dataset):
     """
     相邻点对数据集
