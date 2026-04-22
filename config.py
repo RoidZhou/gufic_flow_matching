@@ -35,7 +35,7 @@ class TrainConfig:
     pred_horizon: int = 100
 
     # 采样步长
-    stride: int = 5
+    stride: int = 1
 
     # 混合损失权重
     lambda_vel: float = 1.0

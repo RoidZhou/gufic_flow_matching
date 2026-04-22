@@ -126,11 +126,17 @@ class RollingForceHistoryFMDataset(Dataset):
             all_v.append(v)
 
             # 需要至少有 K 步历史 + H 步未来
-            start_k = force_hist_len - 1
+            # start_k = force_hist_len - 1
             end_k = T - pred_horizon - 1
 
-            for k in range(start_k, end_k + 1, stride):
-                fe_hist = fe[k - force_hist_len + 1 : k + 1]      # [K,6]
+            for k in range(0, end_k + 1, stride):
+                left = max(0, k - force_hist_len + 1)
+                fe_hist = fe[left : k + 1]      # [K,6]
+                if fe_hist.shape[0] < force_hist_len:
+                    # 如果不足 K 步历史，就在前面补零
+                    pad_len = force_hist_len - fe_hist.shape[0]
+                    fe_hist = np.pad(fe_hist, ((pad_len, 0), (0, 0)), mode="constant")
+
                 v_future = v[k + 1 : k + 1 + pred_horizon]        # [H,6]
 
                 self.samples.append({
