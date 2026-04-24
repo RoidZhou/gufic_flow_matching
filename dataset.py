@@ -8,6 +8,16 @@ import matplotlib.pyplot as plt
 import glob
 import os   
 
+def rotmat_batch_to_rot6d(R: np.ndarray) -> np.ndarray:
+    """
+    R: [N, 3, 3]
+    return: [N, 6]
+    """
+    R = np.asarray(R, dtype=np.float32)
+    assert R.ndim == 3 and R.shape[-2:] == (3, 3)
+    rot6d = R[:, :, :2].transpose(0, 2, 1).reshape(-1, 6)
+    return rot6d.astype(np.float32)
+
 class FlowMatchingDataset(Dataset):
     """
     相邻点对数据集
@@ -113,12 +123,18 @@ class RollingForceHistoryFMDataset(Dataset):
 
         for f in demo_files:
             data = np.load(f)
-
+            if "p" not in data:
+                raise ValueError(f"p not found in {f}")
+            if "R" not in data:
+                raise ValueError(f"R not found in {f}")
             if "Vd_star" not in data:
                 raise ValueError(f"Vd_star not found in {f}")
             if "Fe" not in data:
                 raise ValueError(f"Fe not found in {f}")
-
+            p = data["p"].astype(np.float32)       # [T,3]
+            R = data["R"].astype(np.float32)       # [T,3]
+            R6d = rotmat_batch_to_rot6d(R)                        # [T,6]
+            x = np.concatenate([p, R6d], axis=-1)        # [T,6]
             v = data["Vd_star"].astype(np.float32)   # [T,6]
             fe = data["Fe"].astype(np.float32)       # [T,6]
 
@@ -132,14 +148,20 @@ class RollingForceHistoryFMDataset(Dataset):
             for k in range(0, end_k + 1, stride):
                 left = max(0, k - force_hist_len + 1)
                 fe_hist = fe[left : k + 1]      # [K,6]
+                x_hist = x[left : k + 1]      # [K,6]
                 if fe_hist.shape[0] < force_hist_len:
                     # 如果不足 K 步历史，就在前面补零
                     pad_len = force_hist_len - fe_hist.shape[0]
                     fe_hist = np.pad(fe_hist, ((pad_len, 0), (0, 0)), mode="constant")
-
+                if x_hist.shape[0] < force_hist_len:
+                    # 如果整个序列都不足 K 步，就在前面补零
+                    pad_len = force_hist_len - x_hist.shape[0]
+                    pad = np.repeat(x_hist[0:1], pad_len, axis=0)
+                    x_hist = np.concatenate([pad, x_hist], axis=0)
                 v_future = v[k + 1 : k + 1 + pred_horizon]        # [H,6]
 
                 self.samples.append({
+                    "x_hist":x_hist,
                     "fe_hist": fe_hist,
                     "v_future_raw": v_future,
                 })
@@ -179,12 +201,14 @@ class RollingForceHistoryFMDataset(Dataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-
+        x_hist = s["x_hist"]
+        x_hist_flat = x_hist.reshape(-1)        # [6K]
         fe_hist = s["fe_hist"]                    # [K,6]
         fe_hist_flat = fe_hist.reshape(-1)        # [6K]
+        cond_hist = np.concatenate([x_hist_flat, fe_hist_flat], axis=-1)   # [12K]
 
         return (
-            torch.from_numpy(fe_hist_flat.astype(np.float32)),   # [6K]
+            torch.from_numpy(cond_hist.astype(np.float32)),   # [6K]
             torch.from_numpy(s["v_future"].astype(np.float32)),  # [H,6]
         )
 

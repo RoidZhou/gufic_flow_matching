@@ -25,11 +25,10 @@ class TrainConfig:
     hidden_dim: int = 256
     num_layers: int = 4
     time_dim: int = 64
-    cond_dim: int = 6
 
     # 条件 = 最近 K 步力序列，展平后维度 = 6*K
     force_hist_len: int = 16
-    cond_dim: int = 6 * 16
+    cond_dim: int = 15 * 16
 
     # 未来预测 horizon
     pred_horizon: int = 100
@@ -41,6 +40,8 @@ class TrainConfig:
     lambda_vel: float = 1.0
     lambda_fm: float = 0.2
     lambda_fm_ori: float = 0.05
+    # 推理采样步长
+    infer_steps: int = 10
 
     # path
     alpha: float = 0.35

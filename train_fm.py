@@ -238,14 +238,14 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         model.train()
         train_sum, train_count = 0.0, 0
 
-        for fe_hist_flat, v_future in train_loader:
-            fe_hist_flat = fe_hist_flat.to(device).float()   # [B, 6K]
+        for cond_hist, v_future in train_loader:
+            cond_hist_flat = cond_hist.to(device).float()           # [B, 6K]
             v_future = v_future.to(device).float()           # [B, H, 6]
 
             # FM tuple on future velocity trajectory
             _, x1, t, xt, ut = path_sampler.sample_training_tuple(v_future)
 
-            pred = model(xt, t, fe_hist_flat)                # 条件 = 最近 K 步力历史
+            pred = model(xt, t, cond_hist_flat)                # 条件 = 最近 K 步力历史
             loss = F.mse_loss(pred, ut)
 
             optimizer.zero_grad()
@@ -253,7 +253,7 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
 
-            bs = fe_hist_flat.shape[0]
+            bs = cond_hist_flat.shape[0]
             train_sum += loss.item() * bs
             train_count += bs
 
@@ -263,16 +263,16 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         model.eval()
         val_sum, val_count = 0.0, 0
         with torch.no_grad():
-            for fe_hist_flat, v_future in val_loader:
-                fe_hist_flat = fe_hist_flat.to(device).float()
+            for cond_hist_flat, v_future in val_loader:
+                cond_hist_flat = cond_hist_flat.to(device).float()
                 v_future = v_future.to(device).float()
 
                 _, x1, t, xt, ut = path_sampler.sample_training_tuple(v_future)
 
-                pred = model(xt, t, fe_hist_flat)
+                pred = model(xt, t, cond_hist_flat)
                 loss = F.mse_loss(pred, ut)
 
-                bs = fe_hist_flat.shape[0]
+                bs = cond_hist_flat.shape[0]
                 val_sum += loss.item() * bs
                 val_count += bs
 
@@ -297,7 +297,7 @@ if __name__ == "__main__":
                         val_demo_dir="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos",
                         epochs=1000, 
                         batch_size=8, 
-                        save_dir="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_fixed_start")
+                        save_dir="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_pRFe_fixed_start")
     path_sampler = CurvedPathCFM(alpha=cfg.alpha, eps=cfg.eps)
 
     if cfg.train_mode == "fixed_length":

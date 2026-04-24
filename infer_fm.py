@@ -5,8 +5,8 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 
-from model import VelocityFMMLP, VelocityFMTransformer, VelocityFMCondUnet1D
-from config import TrainConfig
+from gufic_env.flow_matching.model import VelocityFMMLP, VelocityFMTransformer, VelocityFMCondUnet1D
+from  gufic_env.flow_matching.config import TrainConfig
 
 
 # ============================================================
@@ -42,7 +42,7 @@ def load_model(ckpt_path, device="cuda"):
             time_dim=cfg.time_dim,
             hidden_dim=cfg.hidden_dim,
             num_layers=cfg.num_layers,
-            use_cond=False,
+            use_cond=True,
         ).to(device)
     elif model_name == "unet":
         model = VelocityFMCondUnet1D(
@@ -64,7 +64,7 @@ def load_model(ckpt_path, device="cuda"):
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    stats = ckpt.get("stats", None)
+    stats = ckpt.get("v_stats", None)
     if stats is None:
         raise ValueError("Checkpoint 中没有找到 stats，请先在训练保存时把 v_mean / v_std 一起存进去。")
 
@@ -96,6 +96,7 @@ def load_one_demo(npz_path):
     data = np.load(npz_path)
     demo = {
         "v": data["Vd_star"].astype(np.float32),      # [T, 6]
+        "fe": data["Fe"].astype(np.float32),      # [T, 6]
         "t": data["t"].astype(np.float32),            # [T]
         "total_time": float(data["total_time"][0]),
     }
@@ -116,34 +117,47 @@ def sample_velocity_trajectory(
     steps=100,
     return_history=True,
     seed=None,
+    cfg=None,
+    cond=None,
 ):
     """
-    无条件 FM 采样：
+    条件 / 无条件 FM 采样
+
+    无条件:
       v_t ~ N(0, I)
       u_pred = model(v_t, t)
       v_t <- v_t + u_pred * dt
 
+    条件:
+      v_t ~ N(0, I)
+      u_pred = model(v_t, t, fe_cond)
+      v_t <- v_t + u_pred * dt
+
     这里:
-      - v_t 是当前生成中的“速度轨迹样本”
+      - v_t 是当前生成中的“速度轨迹样本”（normalized space）
       - u_pred 是 FM 的流速度（normalized space）
       - 最终生成结果是 v_sample_final，而不是 u_final
 
     Args:
-      traj_len:      轨迹长度 T
-      stats:         {"v_mean": ..., "v_std": ...}
-      steps:         ODE 采样步数
-      return_history:是否返回采样历史
-      seed:          随机种子，可选
+      traj_len:       轨迹长度 T
+      stats:          {"v_mean": ..., "v_std": ...}
+      steps:          ODE 采样步数
+      return_history: 是否返回采样历史
+      seed:           随机种子，可选
+      cfg:            训练配置，要求含 use_cond / cond_dim
+      cond:           条件输入
+                      - 若使用最近 K 步力序列，可传 [K, 6]
+                      - 或传已经 flatten 后的 [6*K]
 
     Returns:
       result = {
-        "v_sample_final":      [T, 6]   # 反归一化后的最终生成速度轨迹
-        "v_sample_final_norm": [T, 6]   # 归一化空间里的最终轨迹
-        "u_final_norm":        [T, 6]   # 最后一步模型输出（flow velocity）
-        "v_sample_history":    [steps+1, T, 6] or None   # 反归一化后的历史
-        "v_sample_history_norm":[steps+1, T, 6] or None  # 归一化空间里的历史
-        "u_history_norm":      [steps, T, 6] or None
-        "step_t":              [steps+1]
+        "v_sample_final":       [T, 6]   # 反归一化后的最终生成速度轨迹
+        "v_sample_final_norm":  [T, 6]   # 归一化空间里的最终轨迹
+        "u_final_norm":         [T, 6]   # 最后一步模型输出（flow velocity）
+        "v_sample_history":     [steps+1, T, 6] or None   # 反归一化后的历史
+        "v_sample_history_norm":[steps+1, T, 6] or None   # 归一化空间里的历史
+        "u_history_norm":       [steps, T, 6] or None
+        "step_t":               [steps+1]
       }
     """
     if seed is not None:
@@ -154,6 +168,45 @@ def sample_velocity_trajectory(
 
     # 初始噪声：速度轨迹样本（normalized space）
     v_t = torch.randn(1, traj_len, 6, device=device)
+
+    # --------------------------------------------------------
+    # 处理条件：最近 K 步力序列
+    # cond 支持:
+    #   [K, 6]   -> 自动 flatten 成 [1, 6*K]
+    #   [6*K]    -> 自动变成 [1, 6*K]
+    # --------------------------------------------------------
+    fe_cond = None
+    use_cond = bool(getattr(cfg, "use_cond", False)) if cfg is not None else False
+
+    if use_cond:
+        if cond is None:
+            raise ValueError("cfg.use_cond=True 时，cond 不能为 None。")
+
+        if isinstance(cond, np.ndarray):
+            cond_np = cond.astype(np.float32)
+        else:
+            cond_np = np.asarray(cond, dtype=np.float32)
+
+        # cond: [K,6] -> [6K]
+        if cond_np.ndim == 2:
+            cond_np = cond_np.reshape(-1)
+
+        # cond: [6K] -> [1,6K]
+        if cond_np.ndim == 1:
+            cond_np = cond_np[None, :]
+
+        # 最终要求 [1, cond_dim]
+        if cond_np.ndim != 2:
+            raise ValueError(f"cond 期望形状为 [K,6] 或 [6*K]，当前是 {cond_np.shape}")
+
+        fe_cond = torch.from_numpy(cond_np).to(device).float()   # [1, cond_dim]
+
+        # 可选检查
+        if hasattr(cfg, "cond_dim"):
+            if fe_cond.shape[-1] != cfg.cond_dim:
+                raise ValueError(
+                    f"cond 维度不匹配: got {fe_cond.shape[-1]}, expected {cfg.cond_dim}"
+                )
 
     v_sample_history_norm = []
     u_history_norm = []
@@ -172,8 +225,12 @@ def sample_velocity_trajectory(
             dtype=v_t.dtype
         )
 
-        # 模型输出的是 normalized space 里的 flow velocity
-        u_pred = model(x_t=v_t, t=t_value)   # [1, T, 6]
+        if use_cond:
+            # Transformer forward 支持 fe: [B, cond_dim]
+            # 内部会自动扩成 [B, T, cond_dim]
+            u_pred = model(x_t=v_t, t=t_value, fe=fe_cond)   # [1, T, 6]
+        else:
+            u_pred = model(x_t=v_t, t=t_value)               # [1, T, 6]
 
         if return_history:
             u_history_norm.append(u_pred.squeeze(0).detach().cpu().numpy().copy())
@@ -194,7 +251,7 @@ def sample_velocity_trajectory(
     if return_history:
         v_sample_history_norm = np.stack(v_sample_history_norm, axis=0).astype(np.float32)  # [steps+1, T, 6]
         v_sample_history = denormalize_v(v_sample_history_norm, stats).astype(np.float32)
-        u_history_norm = np.stack(u_history_norm, axis=0).astype(np.float32)               # [steps, T, 6]
+        u_history_norm = np.stack(u_history_norm, axis=0).astype(np.float32)                 # [steps, T, 6]
         step_t = np.array(step_t, dtype=np.float32)
     else:
         v_sample_history_norm = None
@@ -403,34 +460,102 @@ def run_direct_field_inference(
     model, cfg, ckpt, stats = load_model(ckpt_path, device=device)
 
     demo = load_one_demo(demo_path)
-    v_gt = demo["v"]
-
-    if len(v_gt) > max_points:
-        idx = np.linspace(0, len(v_gt) - 1, max_points).astype(int)
-        v_gt = v_gt[idx]
-
-    traj_len = len(v_gt)
 
     # ========================================================
-    # 无条件 FM 速度轨迹采样
+    # 无条件/条件 FM 速度轨迹采样
     # ========================================================
-    result = sample_velocity_trajectory(
-        model=model,
-        traj_len=traj_len,
-        stats=stats,
-        device=device,
-        steps=steps,
-        return_history=True,
-        seed=seed,
-    )
+    if cfg.train_mode == "fixed_length":
+        v_gt = demo["v"]
+        if cfg.use_cond:
+            cond = demo["fe"]
+        else:
+            cond = None
 
-    v_sample_pred = result["v_sample_final"]          # [T,6]，真正的生成结果（反归一化后）
-    v_sample_pred_norm = result["v_sample_final_norm"]
-    u_final_norm = result["u_final_norm"]             # 最后一步 flow velocity（normalized space）
-    v_sample_history = result["v_sample_history"]     # [steps+1, T, 6]（反归一化后）
-    v_sample_history_norm = result["v_sample_history_norm"]
-    u_history_norm = result["u_history_norm"]
-    step_t = result["step_t"]
+        if len(v_gt) > max_points:
+            idx = np.linspace(0, len(v_gt) - 1, max_points).astype(int)
+            v_gt = v_gt[idx]
+        traj_len = len(v_gt)
+
+        result = sample_velocity_trajectory(
+            model=model,
+            traj_len=traj_len,
+            stats=stats,
+            device=device,
+            steps=steps,
+            return_history=True,
+            seed=seed,
+            cfg=cfg,
+            cond=cond,
+        )
+
+        v_sample_pred = result["v_sample_final"]          # [T,6]，真正的生成结果（反归一化后）
+        v_sample_pred_norm = result["v_sample_final_norm"]
+        u_final_norm = result["u_final_norm"]             # 最后一步 flow velocity（normalized space）
+        v_sample_history = result["v_sample_history"]     # [steps+1, T, 6]（反归一化后）
+        v_sample_history_norm = result["v_sample_history_norm"]
+        u_history_norm = result["u_history_norm"]
+        step_t = result["step_t"]
+    elif cfg.train_mode == "rolling_horizon":
+        v_sample_final = []
+        v_sample_final_norm = []
+        u_final_norm = []
+        v_sample_history = []
+        v_sample_history_norm = []
+        u_history_norm = []
+        step_t = []
+
+        traj_len = cfg.pred_horizon
+
+        # 滚动 horizon 模式下 demo 轨迹太长了，直接用 max_points 定死生成长度
+        for i in range(len(demo["v"])-1):
+            left = max(0, i-cfg.force_hist_len+1)
+            cond = demo["fe"][left : i + 1]      # [K,6]，滚动取最近 K 步力作为条件
+            if cond.shape[0] < cfg.force_hist_len:
+                # 如果不足 K 步历史，就在前面补零
+                pad_len = cfg.force_hist_len - cond.shape[0]
+                cond = np.pad(cond, ((pad_len, 0), (0, 0)), mode="constant")
+
+            result = sample_velocity_trajectory(
+                model=model,
+                traj_len=traj_len,
+                stats=stats,
+                device=device,
+                steps=steps,
+                return_history=True,
+                seed=seed,
+                cfg=cfg,
+                cond=cond,
+            )
+            
+            v_sample_final.append(result["v_sample_final"][0:cfg.stride,:])
+            v_sample_final_norm.append(result["v_sample_final_norm"][0:cfg.stride,:])
+            u_final_norm.append(result["u_final_norm"][0:cfg.stride,:])
+            v_sample_history.append(result["v_sample_history"][0:cfg.stride,:])
+            v_sample_history_norm.append(result["v_sample_history_norm"][0:cfg.stride,:])
+            u_history_norm.append(result["u_history_norm"][0:cfg.stride,:])
+            step_t.append(result["step_t"][0:cfg.stride])
+        
+        v_sample_pred = np.stack(v_sample_final, axis=0).astype(np.float32) 
+        v_sample_pred_norm = np.stack(v_sample_final_norm, axis=0).astype(np.float32)
+        u_final_norm = np.stack(u_final_norm, axis=0).astype(np.float32)
+        v_sample_history = np.stack(v_sample_history, axis=0).astype(np.float32)
+        v_sample_history_norm = np.stack(v_sample_history_norm, axis=0).astype(np.float32)
+        u_history_norm = np.stack(u_history_norm, axis=0).astype(np.float32)
+        step_t = np.stack(step_t, axis=0).astype(np.float32)
+
+        v_sample_pred = v_sample_pred[:, 0, :]
+        v_sample_pred_norm = v_sample_pred_norm[:, 0, :]
+        u_final_norm = u_final_norm[:, 0, :]
+        v_sample_history = v_sample_history[:, 0, :]
+        v_sample_history_norm = v_sample_history_norm[:, 0, :]
+        u_history_norm = u_history_norm[:, 0, :]
+        step_t = step_t[:, 0]
+        v_gt = demo["v"][1:1+len(v_sample_pred)]
+
+    else:
+        raise ValueError(f"Unknown train_mode: {cfg.train_mode}")
+
+
 
     print("==== Unconditional FM Velocity Generation ====")
     print(f"generated traj len : {len(v_sample_pred)}")
@@ -507,10 +632,10 @@ def run_direct_field_inference(
 
 if __name__ == "__main__":
     run_direct_field_inference(
-        ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_random_start/fm_best.pt",
+        ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_fixed_start/fm_transformer_best_4.22v2.pt",
         demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos/bolt_demo_0000.npz",
-        out_dir="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_fm",
+        out_dir="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_fixed_start",
         max_points=10000,
-        steps=100,
+        steps=10,
         seed=42,
     )
