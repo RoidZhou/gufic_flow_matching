@@ -102,6 +102,7 @@ class RollingForceHistoryFMDataset(Dataset):
     def __init__(
         self,
         demo_dir,
+        x_hist_len=1,
         force_hist_len=16,
         pred_horizon=100,
         stride=5,
@@ -111,6 +112,7 @@ class RollingForceHistoryFMDataset(Dataset):
     ):
         self.samples = []
         self.force_hist_len = force_hist_len
+        self.x_hist_len = x_hist_len
         self.pred_horizon = pred_horizon
         self.normalize_v = normalize_v
         self.eps = eps
@@ -134,7 +136,7 @@ class RollingForceHistoryFMDataset(Dataset):
             p = data["p"].astype(np.float32)       # [T,3]
             R = data["R"].astype(np.float32)       # [T,3]
             R6d = rotmat_batch_to_rot6d(R)                        # [T,6]
-            x = np.concatenate([p, R6d], axis=-1)        # [T,6]
+            x = np.concatenate([p, R6d], axis=-1)        # [T,9]
             v = data["Vd_star"].astype(np.float32)   # [T,6]
             fe = data["Fe"].astype(np.float32)       # [T,6]
 
@@ -146,16 +148,17 @@ class RollingForceHistoryFMDataset(Dataset):
             end_k = T - pred_horizon - 1
 
             for k in range(0, end_k + 1, stride):
-                left = max(0, k - force_hist_len + 1)
-                fe_hist = fe[left : k + 1]      # [K,6]
-                x_hist = x[left : k + 1]      # [K,6]
+                fe_left = max(0, k - force_hist_len + 1)
+                x_left = max(0, k - x_hist_len + 1)
+                fe_hist = fe[fe_left : k + 1]      # [K,6]
+                x_hist = x[x_left : k + 1]      # [K,6]
                 if fe_hist.shape[0] < force_hist_len:
                     # 如果不足 K 步历史，就在前面补零
                     pad_len = force_hist_len - fe_hist.shape[0]
                     fe_hist = np.pad(fe_hist, ((pad_len, 0), (0, 0)), mode="constant")
-                if x_hist.shape[0] < force_hist_len:
+                if x_hist.shape[0] < x_hist_len:
                     # 如果整个序列都不足 K 步，就在前面补零
-                    pad_len = force_hist_len - x_hist.shape[0]
+                    pad_len = x_hist_len - x_hist.shape[0]
                     pad = np.repeat(x_hist[0:1], pad_len, axis=0)
                     x_hist = np.concatenate([pad, x_hist], axis=0)
                 v_future = v[k + 1 : k + 1 + pred_horizon]        # [H,6]

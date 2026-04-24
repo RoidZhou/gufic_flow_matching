@@ -180,6 +180,7 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
 
     train_dataset = RollingForceHistoryFMDataset(
         demo_dir=cfg.train_demo_dir,
+        x_hist_len=cfg.x_hist_len,
         force_hist_len=cfg.force_hist_len,
         pred_horizon=cfg.pred_horizon,
         stride=cfg.stride,
@@ -190,6 +191,7 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
 
     val_dataset = RollingForceHistoryFMDataset(
         demo_dir=cfg.val_demo_dir,
+        x_hist_len=cfg.x_hist_len,
         force_hist_len=cfg.force_hist_len,
         pred_horizon=cfg.pred_horizon,
         stride=cfg.stride,
