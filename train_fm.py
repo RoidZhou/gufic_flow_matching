@@ -185,9 +185,9 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         pred_horizon=cfg.pred_horizon,
         stride=cfg.stride,
         normalize_v=True,
-        v_stats=None,
+        cond_stats=None,
     )
-    v_stats = train_dataset.get_v_stats()
+    cond_stats = train_dataset.get_cond_stats()
 
     val_dataset = RollingForceHistoryFMDataset(
         demo_dir=cfg.val_demo_dir,
@@ -196,7 +196,7 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         pred_horizon=cfg.pred_horizon,
         stride=cfg.stride,
         normalize_v=True,
-        v_stats=v_stats,
+        cond_stats=cond_stats,
     )
 
     train_loader = DataLoader(
@@ -287,7 +287,7 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
                     "model": model.state_dict(),
                     "train_cfg": cfg.__dict__,
                     "best_loss": best_loss,
-                    "v_stats": v_stats,
+                    "cond_stats": cond_stats,
                 },
                 os.path.join(cfg.save_dir, f"fm_{cfg.model}_best.pt"),
             )

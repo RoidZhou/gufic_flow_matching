@@ -107,7 +107,7 @@ class RollingForceHistoryFMDataset(Dataset):
         pred_horizon=100,
         stride=5,
         normalize_v=True,
-        v_stats=None,
+        cond_stats=None,
         eps=1e-6,
     ):
         self.samples = []
@@ -121,6 +121,9 @@ class RollingForceHistoryFMDataset(Dataset):
         if len(demo_files) == 0:
             raise ValueError(f"No demo files found in {demo_dir}")
 
+        all_p = []
+        all_R = []
+        all_Fe = []
         all_v = []
 
         for f in demo_files:
@@ -136,11 +139,13 @@ class RollingForceHistoryFMDataset(Dataset):
             p = data["p"].astype(np.float32)       # [T,3]
             R = data["R"].astype(np.float32)       # [T,3]
             R6d = rotmat_batch_to_rot6d(R)                        # [T,6]
-            x = np.concatenate([p, R6d], axis=-1)        # [T,9]
-            v = data["Vd_star"].astype(np.float32)   # [T,6]
             fe = data["Fe"].astype(np.float32)       # [T,6]
+            v = data["Vd_star"].astype(np.float32)   # [T,6]
 
             T = len(v)
+            all_p.append(p)
+            all_R.append(R6d)
+            all_Fe.append(fe)
             all_v.append(v)
 
             # 需要至少有 K 步历史 + H 步未来
@@ -149,23 +154,28 @@ class RollingForceHistoryFMDataset(Dataset):
 
             for k in range(0, end_k + 1, stride):
                 fe_left = max(0, k - force_hist_len + 1)
-                x_left = max(0, k - x_hist_len + 1)
+                p_left = max(0, k - x_hist_len + 1)
+                R_left = max(0, k - x_hist_len + 1)
                 fe_hist = fe[fe_left : k + 1]      # [K,6]
-                x_hist = x[x_left : k + 1]      # [K,6]
+                p_hist = p[p_left : k + 1]      # [K,6]
+                R_hist = R6d[R_left : k + 1]      # [K,6]
                 if fe_hist.shape[0] < force_hist_len:
                     # 如果不足 K 步历史，就在前面补零
                     pad_len = force_hist_len - fe_hist.shape[0]
                     fe_hist = np.pad(fe_hist, ((pad_len, 0), (0, 0)), mode="constant")
-                if x_hist.shape[0] < x_hist_len:
+                if p_hist.shape[0] < x_hist_len:
                     # 如果整个序列都不足 K 步，就在前面补零
-                    pad_len = x_hist_len - x_hist.shape[0]
-                    pad = np.repeat(x_hist[0:1], pad_len, axis=0)
-                    x_hist = np.concatenate([pad, x_hist], axis=0)
+                    pad_len = x_hist_len - p_hist.shape[0]
+                    pad_p = np.repeat(p_hist[0:1], pad_len, axis=0)
+                    pad_R = np.repeat(R_hist[0:1], pad_len, axis=0)
+                    p_hist = np.concatenate([pad_p, p_hist], axis=0)
+                    R_hist = np.concatenate([pad_R, R_hist], axis=0)
                 v_future = v[k + 1 : k + 1 + pred_horizon]        # [H,6]
 
                 self.samples.append({
-                    "x_hist":x_hist,
-                    "fe_hist": fe_hist,
+                    "p_hist_raw":p_hist,
+                    "R_hist_raw":R_hist,
+                    "fe_hist_raw": fe_hist,
                     "v_future_raw": v_future,
                 })
 
@@ -173,27 +183,67 @@ class RollingForceHistoryFMDataset(Dataset):
             raise ValueError("No valid rolling-horizon samples found.")
 
         # 只对 v 做标准化
-        if v_stats is None:
+        if cond_stats is None:
+            all_p_cat = np.concatenate(all_p, axis=0)  # [sum(T), 6]
+            p_mean = all_p_cat.mean(axis=0, keepdims=True).astype(np.float32)
+            p_std = all_p_cat.std(axis=0, keepdims=True).astype(np.float32)
+            p_std = np.clip(p_std, eps, None)
+
+            all_R_cat = np.concatenate(all_R, axis=0)  # [sum(T), 6]
+            R_mean = all_R_cat.mean(axis=0, keepdims=True).astype(np.float32)
+            R_std = all_R_cat.std(axis=0, keepdims=True).astype(np.float32)
+            R_std = np.clip(R_std, eps, None)
+
+            all_fe_cat = np.concatenate(all_Fe, axis=0)  # [sum(T), 6]
+            fe_mean = all_fe_cat.mean(axis=0, keepdims=True).astype(np.float32)
+            fe_std = all_fe_cat.std(axis=0, keepdims=True).astype(np.float32)
+            fe_std = np.clip(fe_std, eps, None)
+            
             all_v_cat = np.concatenate(all_v, axis=0)  # [sum(T), 6]
             v_mean = all_v_cat.mean(axis=0, keepdims=True).astype(np.float32)
             v_std = all_v_cat.std(axis=0, keepdims=True).astype(np.float32)
             v_std = np.clip(v_std, eps, None)
-            self.v_stats = {
+
+            self.cond_stats = {
+                "p_mean": p_mean,
+                "p_std": p_std,
+                "R_mean": R_mean,
+                "R_std": R_std,
+                "fe_mean": fe_mean,
+                "fe_std": fe_std,
                 "v_mean": v_mean,
                 "v_std": v_std,
             }
         else:
-            self.v_stats = {
-                "v_mean": v_stats["v_mean"].astype(np.float32),
-                "v_std": np.clip(v_stats["v_std"].astype(np.float32), eps, None),
+            self.cond_stats = {
+                "p_mean": cond_stats["p_mean"].astype(np.float32),
+                "p_std": np.clip(cond_stats["p_std"].astype(np.float32), eps, None),
+                "R_mean": cond_stats["R_mean"].astype(np.float32),
+                "R_std": np.clip(cond_stats["R_std"].astype(np.float32), eps, None),
+                "fe_mean": cond_stats["fe_mean"].astype(np.float32),
+                "fe_std": np.clip(cond_stats["fe_std"].astype(np.float32), eps, None),
+                "v_mean": cond_stats["v_mean"].astype(np.float32),
+                "v_std": np.clip(cond_stats["v_std"].astype(np.float32), eps, None),
             }
 
         for s in self.samples:
             if normalize_v:
+                s["p_hist"] = (
+                    (s["p_hist_raw"] - self.cond_stats["p_mean"]) / self.cond_stats["p_std"]
+                ).astype(np.float32)
+                s["R_hist"] = (
+                    (s["R_hist_raw"] - self.cond_stats["R_mean"]) / self.cond_stats["R_std"]
+                ).astype(np.float32)
+                s["fe_hist"] = (
+                    (s["fe_hist_raw"] - self.cond_stats["fe_mean"]) / self.cond_stats["fe_std"]
+                ).astype(np.float32)
                 s["v_future"] = (
-                    (s["v_future_raw"] - self.v_stats["v_mean"]) / self.v_stats["v_std"]
+                    (s["v_future_raw"] - self.cond_stats["v_mean"]) / self.cond_stats["v_std"]
                 ).astype(np.float32)
             else:
+                s["p_hist"] = s["p_hist_raw"].astype(np.float32)
+                s["R_hist"] = s["R_hist_raw"].astype(np.float32)
+                s["fe_hist"] = s["fe_hist_raw"].astype(np.float32)
                 s["v_future"] = s["v_future_raw"].astype(np.float32)
 
         print(f"[RollingForceHistoryFMDataset] samples = {len(self.samples)}")
@@ -204,10 +254,13 @@ class RollingForceHistoryFMDataset(Dataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        x_hist = s["x_hist"]
-        x_hist_flat = x_hist.reshape(-1)        # [6K]
+        p_hist = s["p_hist"]
+        p_hist_flat = p_hist.reshape(-1)        # [6K]
+        R_hist = s["R_hist"]
+        R_hist_flat = R_hist.reshape(-1)        # [6K]
         fe_hist = s["fe_hist"]                    # [K,6]
         fe_hist_flat = fe_hist.reshape(-1)        # [6K]
+        x_hist_flat = np.concatenate([p_hist_flat, R_hist_flat], axis=-1)   # [12K]
         cond_hist = np.concatenate([x_hist_flat, fe_hist_flat], axis=-1)   # [12K]
 
         return (
@@ -215,8 +268,8 @@ class RollingForceHistoryFMDataset(Dataset):
             torch.from_numpy(s["v_future"].astype(np.float32)),  # [H,6]
         )
 
-    def get_v_stats(self):
-        return self.v_stats
+    def get_cond_stats(self):
+        return self.cond_stats
 
 class FlowMatchingHybridDataset(Dataset):
     """

@@ -510,10 +510,11 @@ def run_direct_field_inference(
 
         # 滚动 horizon 模式下 demo 轨迹太长了，直接用 max_points 定死生成长度
         for i in range(len(demo["v"])-1):
-            left = max(0, i-cfg.force_hist_len+1)
-            cond_fe = demo["fe"][left : i + 1]      # [K,6]，滚动取最近 K 步力作为条件
-            p = demo["p"][left : i + 1].astype(np.float32)       # [T,3]
-            R = demo["R"][left : i + 1].astype(np.float32)       # [T,3]
+            fe_left = max(0, i-cfg.force_hist_len+1)
+            x_left = max(0, i - cfg.x_hist_len + 1)
+            cond_fe = demo["fe"][fe_left : i + 1]      # [K,6]，滚动取最近 K 步力作为条件
+            p = demo["p"][x_left : i + 1].astype(np.float32)       # [T,3]
+            R = demo["R"][x_left : i + 1].astype(np.float32)       # [T,3,3]
             R6d = rotmat_batch_to_rot6d(R)                        # [T,6]
             cond_x = np.concatenate([p, R6d], axis=-1)        # [T,9]
 
@@ -521,13 +522,13 @@ def run_direct_field_inference(
                 # 如果不足 K 步历史，就在前面补零
                 pad_len = cfg.force_hist_len - cond_fe.shape[0]
                 cond_fe = np.pad(cond_fe, ((pad_len, 0), (0, 0)), mode="constant")
-            if cond_x.shape[0] < cfg.force_hist_len:
+            if cond_x.shape[0] < cfg.x_hist_len:
                 # 如果整个序列都不足 K 步，就在前面补零
-                pad_len = cfg.force_hist_len - cond_x.shape[0]
+                pad_len = cfg.x_hist_len - cond_x.shape[0]
                 pad = np.repeat(cond_x[0:1], pad_len, axis=0)
                 cond_x = np.concatenate([pad, cond_x], axis=0)
 
-            cond = np.concatenate([cond_x, cond_fe], axis=-1)
+            cond = np.concatenate([cond_x.reshape(1, -1), cond_fe.reshape(1, -1)], axis=-1)
 
             result = sample_velocity_trajectory(
                 model=model,
@@ -646,7 +647,7 @@ def run_direct_field_inference(
 
 if __name__ == "__main__":
     run_direct_field_inference(
-        ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_pRFe_fixed_start/fm_transformer_pRFe_best.pt",
+        ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_pRFe_fixed_start/cfm_transformer_pRFe_best.pt",
         demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos/bolt_demo_0000.npz",
         out_dir="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_pRFe_fixed_start",
         max_points=10000,
