@@ -1,0 +1,49 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Current Python File",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "/home/zhou/autolab/GUFIC_mujoco-main",
+      "env": {
+        "PYTHONPATH": "/home/zhou/autolab/GUFIC_mujoco-main"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Debug infer_fm",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "gufic_env.flow_matching.infer_fm",
+      "cwd": "/home/zhou/autolab/GUFIC_mujoco-main",
+      "env": {
+        "PYTHONPATH": "/home/zhou/autolab/GUFIC_mujoco-main"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Debug train_fm",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "gufic_env.flow_matching.train_fm",
+      "cwd": "/home/zhou/autolab/GUFIC_mujoco-main",
+      "env": {
+        "PYTHONPATH": "/home/zhou/autolab/GUFIC_mujoco-main"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Debug env_gufic_velocity_field_infer",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "gufic_env.env_gufic_velocity_field_infer",
+      "cwd": "/home/zhou/autolab/GUFIC_mujoco-main",
+      "env": {
+        "PYTHONPATH": "/home/zhou/autolab/GUFIC_mujoco-main"
+      },
+      "console": "integratedTerminal"
+    }
+  ]
+}

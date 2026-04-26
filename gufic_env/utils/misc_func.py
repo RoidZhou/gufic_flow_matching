@@ -95,6 +95,12 @@ def initialize_trajectory(task, max_time = 10):
     if task == 'regulation':
         pd_t_sim = pd_default_sym
         Rd_t_sim = Rd_default_sym
+        # 绕z轴旋转任意角度phi的姿态矩阵 
+        # R_z_phi = sp.Matrix([[sp.cos(1*t), -sp.sin(1*t), 0],
+        #                      [sp.sin(1*t), sp.cos(1*t),  0],
+        #                      [0,          0,            1]])
+        # Rd_t_sim = R_z_phi * Rd_default_sym
+
     elif task == 'circle':
         r = 0.1
         pd_t_sim = pd_default_sym + sp.Matrix([r * sp.cos(t), r * sp.sin(t), 0])

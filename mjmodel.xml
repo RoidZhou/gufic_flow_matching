@@ -1,0 +1,111 @@
+<mujoco model="Indy7">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.001" tolerance="1e-10" jacobian="sparse" iterations="300"/>
+  <size njmax="5000" nconmax="250"/>
+  <visual>
+    <global offwidth="400" offheight="400"/>
+    <quality shadowsize="8192"/>
+    <headlight ambient="0.5 0.45 0.4" diffuse="0.5 0.5 0.5" specular="1 1 1"/>
+    <map force="0.1" zfar="30"/>
+    <scale com="0.01" framelength="0.1" framewidth="0.01"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+  </visual>
+  <statistic meansize="0.05" extent="2" center="0 0 0.278311"/>
+  <default class="main">
+    <joint limited="true" armature="0.04" damping="1"/>
+    <geom condim="6" friction="0.3 0.005 0.0001" solimp="0.95 0.95 0.001 0.5 2" margin="0.002"/>
+  </default>
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.53 0.81 0.92" rgb2="1 1 1" width="512" height="3072"/>
+    <texture type="2d" name="texplane" builtin="checker" mark="cross" rgb1="0.05 0.05 0.05" rgb2="0.05 0.05 0.05" markrgb="0.1 0.1 0.1" width="512" height="512"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="matplane" texture="texplane" texuniform="true" reflectance="0.25"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="2 2" reflectance="0.15"/>
+    <mesh name="Indy7_0" file="robot_mesh/Indy7_0.stl"/>
+    <mesh name="Indy7_1" file="robot_mesh/Indy7_1.stl"/>
+    <mesh name="Indy7_2" file="robot_mesh/Indy7_2.stl"/>
+    <mesh name="Indy7_3" file="robot_mesh/Indy7_3.stl"/>
+    <mesh name="Indy7_4" file="robot_mesh/Indy7_4.stl"/>
+    <mesh name="Indy7_5" file="robot_mesh/Indy7_5.stl"/>
+    <mesh name="Indy7_6" file="robot_mesh/Indy7_6.stl"/>
+    <mesh name="indy_coupling_ft_sensor" file="robot_mesh/indy_coupling_ft_sensor.stl"/>
+    <mesh name="indy_gripper_body" file="robot_mesh/indy_gripper_body.stl"/>
+    <mesh name="indy7_gripper_finger1" file="robot_mesh/gripper_finger_v2.stl"/>
+    <mesh name="indy7_gripper_finger2" file="robot_mesh/gripper_finger_v2_mirror.stl"/>
+    <mesh name="peg" file="robot_mesh/peg_square_399.stl" scale="0.0095 0.0095 0.01"/>
+    <mesh name="hole" file="robot_mesh/hole_square_400.stl" scale="0.01 0.01 0.01"/>
+  </asset>
+  <worldbody>
+    <geom name="floor" size="0 0 1" type="plane" material="groundplane"/>
+    <light pos="0 0 5" dir="0.557086 0.371391 -0.742781" directional="true" diffuse="0.8 0.8 0.8" specular="0.2 0.2 0.2"/>
+    <body name="indy_link0">
+      <inertial pos="0.00104524 -3.79e-06 -0.0150461" quat="0.488076 0.497353 -0.502389 0.511885" mass="1.59307" diaginertia="0.00967002 0.00572299 0.00558954"/>
+      <geom type="mesh" contype="0" conaffinity="0" rgba="0.584 0.584 0.584 1" mesh="Indy7_0"/>
+      <body name="indy_link1" pos="0 0 0.0775">
+        <inertial pos="0 -0.0473238 0.193496" quat="0.646983 -0.156312 0.175179 0.72546" mass="11.803" diaginertia="0.154273 0.154184 0.0347425"/>
+        <joint name="indy_joint1" pos="0 0 0" axis="0 0 1" range="-3.05433 3.05433" armature="4"/>
+        <geom type="mesh" rgba="0.737 0.737 0.768 1" mesh="Indy7_1"/>
+        <body name="indy_link2" pos="0 -0.109 0.222" quat="0.5 0.5 0.5 -0.5">
+          <inertial pos="-0.252661 6.01e-06 0.0594623" quat="0.535651 0.461652 0.461734 0.535497" mass="7.99292" diaginertia="0.29363 0.286497 0.0306505"/>
+          <joint name="indy_joint2" pos="0 0 0" axis="0 0 1" range="-3.05433 3.05433" armature="4"/>
+          <geom type="mesh" rgba="0.737 0.737 0.768 1" mesh="Indy7_2"/>
+          <body name="indy_link3" pos="-0.45 0 -0.0305">
+            <inertial pos="-0.151721 4.441e-05 -0.073199" quat="0.490517 0.508363 -0.522312 -0.477652" mass="2.99134" diaginertia="0.0342713 0.0342015 0.0043907"/>
+            <joint name="indy_joint3" pos="0 0 0" axis="0 0 1" range="-3.05433 3.05433" armature="1"/>
+            <geom type="mesh" rgba="0.737 0.737 0.768 1" mesh="Indy7_3"/>
+            <body name="indy_link4" pos="-0.267 0 -0.075" quat="0.5 -0.5 -0.5 0.5">
+              <inertial pos="6.946e-05 -0.0722404 0.0745651" quat="0.584096 0.811684 -0.000311929 0.00081235" mass="2.12317" diaginertia="0.00672334 0.00662338 0.00236249"/>
+              <joint name="indy_joint4" pos="0 0 0" axis="0 0 1" range="-3.05433 3.05433" armature="1"/>
+              <geom type="mesh" rgba="0.737 0.737 0.768 1" mesh="Indy7_4"/>
+              <body name="indy_link5" pos="0 -0.114 0.083" quat="0.5 0.5 0.5 -0.5">
+                <inertial pos="-0.0928619 6.474e-05 0.0657795" quat="0.464788 0.53361 0.528902 0.468503" mass="2.28865" diaginertia="0.00996598 0.00992026 0.00259951"/>
+                <joint name="indy_joint5" pos="0 0 0" axis="0 0 1" range="-3.05433 3.05433" armature="0.8"/>
+                <geom type="mesh" rgba="0.737 0.737 0.768 1" mesh="Indy7_5"/>
+                <body name="indy_link6" pos="-0.168 0 0.069" quat="0.5 -0.5 -0.5 0.5">
+                  <inertial pos="0 -0.00048743 0.0306234" quat="0.00572522 0.707041 -0.00333531 0.707142" mass="0.400839" diaginertia="0.000596342 0.00044549 0.000435338"/>
+                  <joint name="indy_joint6" pos="0 0 0" axis="0 0 1" range="-3.05433 3.05433" armature="0.8"/>
+                  <geom type="mesh" rgba="0.737 0.737 0.768 1" mesh="Indy7_6"/>
+                  <body name="last_link" pos="0 0 0.06">
+                    <inertial pos="0 -0.00048743 0.0306234" quat="0.00572522 0.707041 -0.00333531 0.707142" mass="1e-09" diaginertia="0 0 0"/>
+                    <site name="ft_sensor" pos="0 0 0.01" size="0.045 0.01" type="cylinder" rgba="1 0 0 0"/>
+                  </body>
+                  <body name="ft_assembly" pos="0 0 0.06">
+                    <geom type="mesh" rgba="0.584 0.584 0.584 1" mesh="indy_coupling_ft_sensor"/>
+                    <site name="end_effector" pos="0 0 0.209" size="0.004" rgba="1 0 0 1"/>
+                    <body name="gripper_body" pos="0 0 0.067">
+                      <geom type="mesh" solref="0.001 1" solimp="0.99 0.99 0.001 0.5 2" mesh="indy_gripper_body"/>
+                      <body name="gripper_finger1" pos="-0.04 -0.0075 0.061">
+                        <inertial pos="0 0 0" mass="0.01" diaginertia="0.001 0.001 0.001"/>
+                        <geom type="mesh" solref="0.001 1" solimp="0.99 0.99 0.001 0.5 2" rgba="0.129 0.129 0.129 1" mesh="indy7_gripper_finger1"/>
+                      </body>
+                      <body name="gripper_finger2" pos="0.04 0.0075 0.061">
+                        <inertial pos="0 0 0" mass="0.01" diaginertia="0.001 0.001 0.001"/>
+                        <geom type="mesh" solref="0.001 1" solimp="0.99 0.99 0.001 0.5 2" rgba="0.129 0.129 0.129 1" mesh="indy7_gripper_finger2"/>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+    <body name="hole" pos="0.4 0 0">
+      <geom name="hole_base_geom" size="0.3" pos="0 0 -0.1" solref="0.001 1" solimp="0.99 0.99 0.001 0.5 2" rgba="0.3 0.3 0.3 1"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <general name="indy_joint0_actuator" joint="indy_joint1" ctrllimited="false" forcelimited="false" ctrlrange="-1000000 1000000" forcerange="-1000000 1000000"/>
+    <general name="indy_joint1_actuator" joint="indy_joint2" ctrllimited="false" forcelimited="false" ctrlrange="-1000000 1000000" forcerange="-1000000 1000000"/>
+    <general name="indy_joint2_actuator" joint="indy_joint3" ctrllimited="false" forcelimited="false" ctrlrange="-1000000 1000000" forcerange="-1000000 1000000"/>
+    <general name="indy_joint3_actuator" joint="indy_joint4" ctrllimited="false" forcelimited="false" ctrlrange="-1000000 1000000" forcerange="-1000000 1000000"/>
+    <general name="indy_joint4_actuator" joint="indy_joint5" ctrllimited="false" forcelimited="false" ctrlrange="-1000000 1000000" forcerange="-1000000 1000000"/>
+    <general name="indy_joint5_actuator" joint="indy_joint6" ctrllimited="false" forcelimited="false" ctrlrange="-1000000 1000000" forcerange="-1000000 1000000"/>
+  </actuator>
+  <sensor>
+    <framepos objtype="site" objname="end_effector"/>
+    <force site="end_effector" name="force_sensor"/>
+    <torque site="end_effector" name="torque_sensor"/>
+  </sensor>
+</mujoco>

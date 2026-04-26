@@ -147,12 +147,12 @@
 
     <actuator>
         <!-- Physical limits of the actuator. -->
-        <motor name="indy_joint0_actuator" joint="indy_joint1" gear="1 0 0 0 0 0" ctrllimited="false" ctrlrange="-1e6 1e6" forcerange="-1e6 1e6"/>
-        <motor name="indy_joint1_actuator" joint="indy_joint2" gear="1 0 0 0 0 0" ctrllimited="false" ctrlrange="-1e6 1e6" forcerange="-1e6 1e6"/>
-        <motor name="indy_joint2_actuator" joint="indy_joint3" gear="1 0 0 0 0 0" ctrllimited="false" ctrlrange="-1e6 1e6" forcerange="-1e6 1e6"/>
-        <motor name="indy_joint3_actuator" joint="indy_joint4" gear="1 0 0 0 0 0" ctrllimited="false" ctrlrange="-1e6 1e6" forcerange="-1e6 1e6"/>
-        <motor name="indy_joint4_actuator" joint="indy_joint5" gear="1 0 0 0 0 0" ctrllimited="false" ctrlrange="-1e6 1e6" forcerange="-1e6 1e6"/>
-        <motor name="indy_joint5_actuator" joint="indy_joint6" gear="1 0 0 0 0 0" ctrllimited="false" ctrlrange="-1e6 1e6" forcerange="-1e6 1e6"/>
+        <motor name="indy_joint0_actuator" joint="indy_joint1" gear="1 0 0 0 0 0" ctrllimited="false" ctrlrange="-1e6 1e6" forcelimited="false" forcerange="-1e6 1e6"/>
+        <motor name="indy_joint1_actuator" joint="indy_joint2" gear="1 0 0 0 0 0" ctrllimited="false" ctrlrange="-1e6 1e6" forcelimited="false" forcerange="-1e6 1e6"/>
+        <motor name="indy_joint2_actuator" joint="indy_joint3" gear="1 0 0 0 0 0" ctrllimited="false" ctrlrange="-1e6 1e6" forcelimited="false" forcerange="-1e6 1e6"/>
+        <motor name="indy_joint3_actuator" joint="indy_joint4" gear="1 0 0 0 0 0" ctrllimited="false" ctrlrange="-1e6 1e6" forcelimited="false" forcerange="-1e6 1e6"/>
+        <motor name="indy_joint4_actuator" joint="indy_joint5" gear="1 0 0 0 0 0" ctrllimited="false" ctrlrange="-1e6 1e6" forcelimited="false" forcerange="-1e6 1e6"/>
+        <motor name="indy_joint5_actuator" joint="indy_joint6" gear="1 0 0 0 0 0" ctrllimited="false" ctrlrange="-1e6 1e6" forcelimited="false" forcerange="-1e6 1e6"/>
         
         <!-- <position ctrllimited="true" ctrlrange="-0.03 0" joint="jointf1" kp="20000" name="actf1"/> -->
         <!-- <position ctrllimited="true" ctrlrange="0.0 0.03" joint="jointf2" kp="20000" name="actf2"/> -->

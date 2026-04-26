@@ -20,24 +20,23 @@ from gufic_env.utils.misc_func import *
 
 
 import matplotlib.pyplot as plt
+from recorder import BoltTrajectoryRecorder
 
 class RobotEnv:
     def __init__(self, robot_name = 'indy7', max_time = 20, show_viewer = False, fz = 5, observables = None,
-                 fix_camera = False, task = 'regulation', randomized_start = False, inertia_shaping = False,
-                 force_filter = True
+                 fix_camera = False, task = 'regulation', randomized_start = False, inertia_shaping = False
                  ):
         
         self.robot_name = robot_name
         self.task = task
         self.randomized_start = randomized_start
         self.inertia_shaping = inertia_shaping
-        self.force_filter = force_filter
 
         if observables is not None:
             self.observables = observables
         else:
             self.observables = ['p', 'pd', 'R', 'Rd', 'x_tf', 'x_ti', 'Fe', 'Fe_raw', 'Fd', 'rho']
-
+        self.demo_recorder = BoltTrajectoryRecorder(save_dir="./bolt_demos_random_start")
         self.fz = fz
         self.fix_camera = fix_camera
         self.fz_mode = "other"
@@ -80,44 +79,7 @@ class RobotEnv:
         # print("Gains:", self.Kp, self.KR, self.Kd, self.kp_force, self.kd_force, self.ki_force, self.zeta)
         # print(self.pd_t(0))
 
-        self.int_sat = 50
 
-        ## For the force tracking
-        self.e_force_prev = np.zeros((6,1))
-        self.int_force_prev = np.zeros((6,1))
-
-        ## For the energy tank
-        self.T_f_low = 0.5
-        self.T_f_high = 20
-        self.delta_f = 1
-
-        self.T_i_low = 0.5
-        self.T_i_high = 20
-        self.delta_i = 1
-
-        T_i_init = 10
-        T_f_init = 10
-
-        if self.task == 'sphere':
-            T_i_init = 90
-            self.T_i_high = 100
-
-        self.x_tf = np.sqrt(2 * T_f_init)
-        self.x_ti = np.sqrt(2 * T_i_init)
-
-        self.T_f = 0.5 * self.x_tf**2
-        self.T_i = 0.5 * self.x_ti**2
-
-        self.d_max = 0.03
-        self.eR_norm_max = 0.05
-
-        ####### Dummy for the printing
-        self.Ff_list = []
-        self.Vb_list = []
-        self.Ff_activation = []
-        self.rho_list = []
-        self.Fd_star_list = []
-        self.Fi_activation = []
 
     def load_xml(self):
         # dir = "/home/joohwan/deeprl/research/GIC_Learning_public/"
@@ -204,6 +166,45 @@ class RobotEnv:
         if self.show_viewer:
             self.viewer.sync()
 
+        self.int_sat = 50
+
+        ## For the force tracking
+        self.e_force_prev = np.zeros((6,1))
+        self.int_force_prev = np.zeros((6,1))
+
+        ## For the energy tank
+        self.T_f_low = 0.5
+        self.T_f_high = 20
+        self.delta_f = 1
+
+        self.T_i_low = 0.5
+        self.T_i_high = 20
+        self.delta_i = 1
+
+        T_i_init = 10
+        T_f_init = 10
+
+        if self.task == 'sphere':
+            T_i_init = 90
+            self.T_i_high = 100
+
+        self.x_tf = np.sqrt(2 * T_f_init)
+        self.x_ti = np.sqrt(2 * T_i_init)
+
+        self.T_f = 0.5 * self.x_tf**2
+        self.T_i = 0.5 * self.x_ti**2
+
+        self.d_max = 0.03
+        self.eR_norm_max = 0.05
+
+        ####### Dummy for the printing
+        self.Ff_list = []
+        self.Vb_list = []
+        self.Ff_activation = []
+        self.rho_list = []
+        self.Fd_star_list = []
+        self.Fi_activation = []
+
         print('Initialization Complete')
         time.sleep(2)
 
@@ -232,12 +233,12 @@ class RobotEnv:
             p, R = self.robot_state.get_pose()
             Fe = self.get_FT_value()
             Fe_raw = self.get_FT_value_raw()
-            # force_x = Fe_raw[0]
-            # force_y = Fe_raw[1]
-            # force_z = Fe_raw[2]
-            # torque_x = Fe_raw[3]
-            # torque_y = Fe_raw[4]
-            # torque_z = Fe_raw[5]
+            force_x = Fe_raw[0]
+            force_y = Fe_raw[1]
+            force_z = Fe_raw[2]
+            torque_x = Fe_raw[3]
+            torque_y = Fe_raw[4]
+            torque_z = Fe_raw[5]
             # self.writer.add_scalars("force_x",
             #                        {"force_x": force_x}, self.golbal_steps)
             # self.writer.add_scalars("force_y",
@@ -264,9 +265,9 @@ class RobotEnv:
             if self.show_viewer:
                 if i % 10 == 0:
                     self.viewer.sync()
-                if i in [4000]:
+                # if i in [4000]:
                     # print('Stopping here')
-                    pass
+                    # pass
 
             if i % 1000 == 0:
                 print(f"Time Step: {i}")
@@ -449,7 +450,6 @@ class RobotEnv:
 
 
     def geometric_unified_force_impedance_control(self):
-        start = time.time()
         Jb = self.robot_state.get_body_jacobian() # 雅可比矩阵
 
         # M,C,G = self.robot_state.get_dynamic_matrices()
@@ -504,71 +504,60 @@ class RobotEnv:
         gd_bar[:3,3] = self.pd_t(t).reshape((-1,))
         Fd_star = self.get_force_field(g, gd_bar).reshape((-1,1))
 
-        if self.force_filter:
-            Fe, d_Fe = self.get_FT_value(return_derivative=True)
-            Fe = Fe.reshape((-1,1))
-            d_Fe = d_Fe.reshape((-1,1))
-
-            # NOTE(JS) Working is version is that to put e_force = - Fe - Fd, with the Fe = -self.robot_state.get_ee_force()
-            # Fd should be positive as well
-            e_force = -Fe - Fd_star
-            de_force = -d_Fe
-            int_force = self.int_force_prev + e_force * self.dt
-
-            int_force = np.clip(int_force, -self.int_sat, self.int_sat)
-
-            if self.fz_mode == "time-varying": # Regular PID Control
-                F_f = - self.kp_force * e_force - self.kd_force * de_force - self.ki_force * int_force + Fd_star
-            else: # Integral action with minor loop
-                F_f = - self.kp_force * (-Fe) - self.ki_force * int_force - self.kd_force * de_force + Fd_star
-        else:
-            self.Kp_force = 10
-            self.Kd_force = 0.0
-            self.Ki_force = 0.0
-
-            Fe = self.get_FT_value_raw().reshape((-1,1))
-            self.force_error = -Fe - Fd_star
-
-            if not hasattr(self, 'prev_force_error'):
-                self.prev_force_error = np.zeros_like(self.force_error)
-            if not hasattr(self, 'integral_force_error'):
-                self.integral_force_error = np.zeros_like(self.force_error)
-
-            d_force_error = (self.force_error - self.prev_force_error) / self.dt
-            self.integral_force_error += self.force_error * self.dt
-
-            limit = np.abs(Fd_star) * 0.5
-            self.integral_force_error = np.clip(self.integral_force_error, -limit, limit)
-
-            F_f = -self.Kp_force * self.force_error - self.Kd_force * d_force_error - self.Ki_force * self.integral_force_error + Fd_star
-            # F_f = -self.Kp_force * self.force_error - self.Kd_force * d_force_error - self.Ki_force * self.integral_force_error + Fd_star
-
-            self.prev_force_error = self.force_error.copy()
+        Fe, d_Fe = self.get_FT_value(return_derivative=True)
         # print("Fe : ", Fe)
-        force_x = Fe[0]
-        force_y = Fe[1]
-        force_z = Fe[2]
-        torque_x = Fe[3]
-        torque_y = Fe[4]
-        torque_z = Fe[5]
-        self.writer.add_scalars("force_x",
-                                {"force_x": force_x}, self.golbal_steps)
-        self.writer.add_scalars("force_y",
-                                {"force_y": force_y}, self.golbal_steps)
-        self.writer.add_scalars("force_z",
-                                {"force_z": force_z}, self.golbal_steps)
-        self.writer.add_scalars("torque_x",
-                                {"torque_x": torque_x}, self.golbal_steps)
-        self.writer.add_scalars("torque_y",
-                                {"torque_y": torque_y}, self.golbal_steps)
-        self.writer.add_scalars("torque_z",
-                                {"torque_z": torque_z}, self.golbal_steps)  
+        # print("d_Fe : ", d_Fe)
+        # print("Fe : ", Fe)
+        Fe = Fe.reshape((-1,1))
+        d_Fe = d_Fe.reshape((-1,1))
+        # force_x = Fe[0]
+        # force_y = Fe[1]
+        # force_z = Fe[2]
+        # torque_x = Fe[3]
+        # torque_y = Fe[4]
+        # torque_z = Fe[5]
+        # self.writer.add_scalars("force_x",
+        #                         {"force_x": force_x}, self.golbal_steps)
+        # self.writer.add_scalars("force_y",
+        #                         {"force_y": force_y}, self.golbal_steps)
+        # self.writer.add_scalars("force_z",
+        #                         {"force_z": force_z}, self.golbal_steps)
+        # self.writer.add_scalars("torque_x",
+        #                         {"torque_x": torque_x}, self.golbal_steps)
+        # self.writer.add_scalars("torque_y",
+        #                         {"torque_y": torque_y}, self.golbal_steps)
+        # self.writer.add_scalars("torque_z",
+        #                         {"torque_z": torque_z}, self.golbal_steps)   
+        # NOTE(JS) Working is version is that to put e_force = - Fe - Fd, with the Fe = -self.robot_state.get_ee_force()
+        # Fd should be positive as well
+
+        e_force = -Fe - Fd_star
+        de_force = -d_Fe
+        int_force = self.int_force_prev + e_force * self.dt
+
+
+        int_force = np.clip(int_force, -self.int_sat, self.int_sat)
+
+        if self.fz_mode == "time-varying": # Regular PID Control
+            F_f = - self.kp_force * e_force - self.kd_force * de_force - self.ki_force * int_force + Fd_star
+        else: # Integral action with minor loop
+            F_f = - self.kp_force * (-Fe) - self.ki_force * int_force - self.kd_force * de_force + Fd_star
         # print("F_f : ", F_f)
         #2.5 Apply shaping function to the force control input
         f_d = Fd_star[:3].reshape((-1,))
         m_d = Fd_star[3:].reshape((-1,))
 
         t = self.iter * self.dt
+
+        self.demo_recorder.add(
+            t=self.iter * self.dt,
+            p=p,
+            R=R,
+            Vd_star=np.asarray(Vd_star).reshape(6),
+            dVd_star=np.asarray(dVd_star).reshape(6),
+            Fe=np.asarray(Fe).reshape(6),
+        )
+
         gd_t = np.eye(4)
         gd_t[:3,:3] = self.Rd_t(t)
         gd_t[:3,3] = self.pd_t(t).reshape((-1,))
@@ -625,9 +614,9 @@ class RobotEnv:
 
         # ensure element-wise multiplication
         F_f = F_f * rho
-        if self.force_filter:
-            self.e_force_prev = e_force
-            self.int_force_prev = int_force
+
+        self.e_force_prev = e_force
+        self.int_force_prev = int_force
 
         # get a scalar value of the inner product of Vb and F_f without any numpy array
         inner_product_f = (Vb.T @ F_f).reshape((-1,))[0]
@@ -684,8 +673,8 @@ class RobotEnv:
         Vd_star_mod = activation_impedance * Vd_star
         dVd_star_mod = activation_impedance * dVd_star
         ev_mod = Vb - Vd_star_mod
-        # self.writer.add_scalars("activation_impedance",
-        #                 {"activation_impedance": activation_impedance}, self.golbal_steps)
+        self.writer.add_scalars("activation_impedance",
+                        {"activation_impedance": activation_impedance}, self.golbal_steps)
 
         # calculate next_step gd
         Vd_mod = adjoint_g_ed(np.linalg.inv(g_ed)) @ Vd_star_mod
@@ -728,8 +717,6 @@ class RobotEnv:
 
         tau_cmd = Jb.T @ tau_tilde + qfrc_bias.reshape((-1,1))
         # print("qfrc_bias : ", qfrc_bias)
-        end = time.time()
-        # print(f"time : {end - start}")
         ####### Save all the dummy variables
         self.Fd_star_list.append(Fd_star)
         self.Ff_list.append(F_f)
@@ -747,9 +734,10 @@ class RobotEnv:
 if __name__ == "__main__":
     robot_name = 'indy7' 
     show_viewer = True
-    randomized_start = False
+    randomized_start = True
     inertia_shaping = False
-
+    episode_number = 50
+    
     task = 'sphere'  # "regulation", 'circle', 'line'
 
     assert task in ['regulation', 'circle', 'line', 'sphere']
@@ -764,8 +752,13 @@ if __name__ == "__main__":
         max_time = 10
 
     RE = RobotEnv(robot_name, show_viewer = show_viewer, max_time = max_time, fz = 10, 
-                  fix_camera = True, task = task, randomized_start=randomized_start, inertia_shaping = inertia_shaping, force_filter = True)
-    RE.run()
+                  fix_camera = True, task = task, randomized_start=randomized_start, inertia_shaping = inertia_shaping)
+    
+    for episode in range(200):
+        RE.reset()
+        RE.run()
+        RE.demo_recorder.save(f"bolt_demo_{episode:04d}")
+        RE.demo_recorder.reset()
 
     if show_viewer:
         RE.viewer.close()
