@@ -10,3 +10,5 @@ development/
 gufic_env/Testing_files/
 MUJOCO_LOG.TXTbolt_demos/ bolt_demos_200eps/ bolt_demos_random_start/ force_plots/
 force_plots/
+force_plots/
+bolt_demos_random_start/
