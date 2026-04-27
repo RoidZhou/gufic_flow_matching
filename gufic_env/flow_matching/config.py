@@ -9,7 +9,8 @@ class TrainConfig:
     train_demo_dir: str = "/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos"
     val_demo_dir: str = "/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos"
     save_dir: str = "./checkpoints_fm"
-
+    
+    type: str = "fixed_start"
     train_mode: str = "rolling_horizon"  # "fixed_length" or "rolling_horizon"
     model: str = "transformer"  # "mlp" or "transformer" or "unet"
 

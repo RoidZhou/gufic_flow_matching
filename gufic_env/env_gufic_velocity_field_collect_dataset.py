@@ -754,7 +754,7 @@ if __name__ == "__main__":
     RE = RobotEnv(robot_name, show_viewer = show_viewer, max_time = max_time, fz = 10, 
                   fix_camera = True, task = task, randomized_start=randomized_start, inertia_shaping = inertia_shaping)
     
-    for episode in range(200):
+    for episode in range(300, 400):
         RE.reset()
         RE.run()
         RE.demo_recorder.save(f"bolt_demo_{episode:04d}")

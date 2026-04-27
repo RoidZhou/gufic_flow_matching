@@ -7,6 +7,8 @@ from dataset import FlowMatchingDataset, RollingForceHistoryFMDataset
 from model import VelocityFMMLP, VelocityFMTransformer,VelocityFMCondUnet1D
 from config import TrainConfig
 from cfm import CurvedPathCFM
+import csv
+from datetime import datetime
 
 def set_seed(seed: int) -> None:
     import random
@@ -175,6 +177,17 @@ def train_velocity_field_fixed_length(cfg: TrainConfig, path_sampler: CurvedPath
 def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedPathCFM):
     set_seed(42)
     ensure_dir(cfg.save_dir)
+    log_dir = os.path.join(cfg.save_dir, "csv_logs")
+    ensure_dir(log_dir)
+
+    csv_path = os.path.join(
+        log_dir,
+        f"train_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    )
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "train_loss", "val_loss", "lr", "best_loss"])
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -289,17 +302,26 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
                     "best_loss": best_loss,
                     "cond_stats": cond_stats,
                 },
-                os.path.join(cfg.save_dir, f"fm_{cfg.model}_best.pt"),
+                os.path.join(cfg.save_dir, f"cfm_{cfg.model}_{cfg.type}_best.pt"),
             )
+        current_lr = optimizer.param_groups[0]["lr"]
 
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([epoch, train_loss, val_loss, current_lr, best_loss])
+    
         print(f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
 
 if __name__ == "__main__":
+    type = "fixed_start"
+    # type = "random_start"
+    
     cfg = TrainConfig(train_demo_dir="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos",
                         val_demo_dir="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos",
+                        type=type,
                         epochs=1000, 
                         batch_size=8, 
-                        save_dir="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_pRFe_fixed_start")
+                        save_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_pRFe_{type}")
     path_sampler = CurvedPathCFM(alpha=cfg.alpha, eps=cfg.eps)
 
     if cfg.train_mode == "fixed_length":

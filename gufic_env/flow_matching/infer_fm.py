@@ -64,7 +64,7 @@ def load_model(ckpt_path, device="cuda"):
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    stats = ckpt.get("v_stats", None)
+    stats = ckpt.get("cond_stats", None)
     if stats is None:
         raise ValueError("Checkpoint 中没有找到 stats，请先在训练保存时把 v_mean / v_std 一起存进去。")
 
@@ -646,10 +646,13 @@ def run_direct_field_inference(
 
 
 if __name__ == "__main__":
+    type = "fixed_start"
+    # type = "random_start"
+
     run_direct_field_inference(
-        ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_pRFe_fixed_start/cfm_transformer_pRFe_best.pt",
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_pRFe_{type}/cfm_transformer_{type}_best.pt",
         demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos/bolt_demo_0000.npz",
-        out_dir="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_pRFe_fixed_start",
+        out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_pRFe_{type})",
         max_points=10000,
         steps=10,
         seed=42,
