@@ -79,12 +79,12 @@ def load_model(ckpt_path, device="cuda"):
 # 只对 v 做归一化 / 反归一化
 # ============================================================
 
-def normalize_v(v, stats):
-    return (v - stats["v_mean"]) / stats["v_std"]
+def normalize_data(data, stats, key="v"):
+    return (data - stats[f"{key}_mean"]) / stats[f"{key}_std"]
 
 
-def denormalize_v(v, stats):
-    return v * stats["v_std"] + stats["v_mean"]
+def denormalize_data(data, stats, key="v"):
+    return data * stats[f"{key}_std"] + stats[f"{key}_mean"]
 
 
 # ============================================================
@@ -248,11 +248,11 @@ def sample_velocity_trajectory(
     u_final_norm = u_pred.squeeze(0).detach().cpu().numpy().astype(np.float32)        # [T,6]
 
     # 只对 v 做反归一化
-    v_sample_final = denormalize_v(v_sample_final_norm, stats).astype(np.float32)
+    v_sample_final = denormalize_data(v_sample_final_norm, stats, "v").astype(np.float32)
 
     if return_history:
         v_sample_history_norm = np.stack(v_sample_history_norm, axis=0).astype(np.float32)  # [steps+1, T, 6]
-        v_sample_history = denormalize_v(v_sample_history_norm, stats).astype(np.float32)
+        v_sample_history = denormalize_data(v_sample_history_norm, stats, "v").astype(np.float32)
         u_history_norm = np.stack(u_history_norm, axis=0).astype(np.float32)                 # [steps, T, 6]
         step_t = np.array(step_t, dtype=np.float32)
     else:
@@ -513,9 +513,16 @@ def run_direct_field_inference(
             fe_left = max(0, i-cfg.force_hist_len+1)
             x_left = max(0, i - cfg.x_hist_len + 1)
             cond_fe = demo["fe"][fe_left : i + 1]      # [K,6]，滚动取最近 K 步力作为条件
+            # 对 fe 做归一化
+            cond_fe = normalize_data(cond_fe, stats, "fe").astype(np.float32)
+
             p = demo["p"][x_left : i + 1].astype(np.float32)       # [T,3]
             R = demo["R"][x_left : i + 1].astype(np.float32)       # [T,3,3]
             R6d = rotmat_batch_to_rot6d(R)                        # [T,6]
+            # 对 p 做归一化
+            p = normalize_data(p, stats, "p").astype(np.float32)
+            # 对 R 做归一化
+            R6d = normalize_data(R6d, stats, "R").astype(np.float32)
             cond_x = np.concatenate([p, R6d], axis=-1)        # [T,9]
 
             if cond_fe.shape[0] < cfg.force_hist_len:
@@ -652,7 +659,7 @@ if __name__ == "__main__":
     run_direct_field_inference(
         ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_pRFe_{type}/cfm_transformer_{type}_best.pt",
         demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos/bolt_demo_0000.npz",
-        out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_pRFe_{type})",
+        out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_pRFe_{type}",
         max_points=10000,
         steps=10,
         seed=42,
