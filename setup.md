@@ -36,3 +36,16 @@ velocity MAE   : 0.000238
 mean ||error|| : 0.000759
 max  ||error|| : 0.096872
 ```
+
+## time = 2026.4.28
+```python
+
+infer No.1
+checkpoint: 37, 0.0024359383802604628, 0.0018670117064048723, 9.966596702259576e-05, 0.001627044685229758
+cfm_transformer_random_start_best2
+
+velocity MSE   : 0.000657
+velocity MAE   : 0.002479
+mean ||error|| : 0.009845
+max  ||error|| : 1.063980
+```

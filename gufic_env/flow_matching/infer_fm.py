@@ -653,11 +653,11 @@ def run_direct_field_inference(
 
 
 if __name__ == "__main__":
-    type = "fixed_start"
-    # type = "random_start"
+    # type = "fixed_start"
+    type = "random_start"
 
     run_direct_field_inference(
-        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_pRFe_{type}/cfm_transformer_{type}_best.pt",
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_pRFe_{type}/cfm_transformer_{type}_best2.pt",
         demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos/bolt_demo_0000.npz",
         out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_pRFe_{type}",
         max_points=10000,

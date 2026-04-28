@@ -117,6 +117,19 @@
                                         </body>
 
                                         <site name="end_effector" type="sphere" size="0.004" pos="0.0 0 0.209" euler="0 0 0" rgba="1 0 0 1.00"/>
+                                        <body name="eye_in_hand_body" pos="0.00 -0.08 0.05" euler="3.1415 0 0">
+                                            <geom name="eye_in_hand_marker"
+                                                type="box"
+                                                size="0.015 0.01 0.01"
+                                                rgba="1 0 0 0.5"
+                                                contype="0"
+                                                conaffinity="0"/>
+                                            <camera name="eye_in_hand"
+                                                    mode="fixed"
+                                                    pos="0 0 0"
+                                                    euler="0 0 0"
+                                                    fovy="70"/>
+                                        </body>
                                         <!-- <body name = "peg" pos = "0.0 0.0 0.0"> -->
                                                 <!-- <joint axis="1 0 0" pos="0 0 0.200" name="slip" range="-3.14 3.14" damping="1" type="hinge"/> -->
                                                 <!-- <joint axis="0 0 1" pos="0 0 0.200" name="slip2" range="-0.03 0.03" damping="50" type="slide"/> -->

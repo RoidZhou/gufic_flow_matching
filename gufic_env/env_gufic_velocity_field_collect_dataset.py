@@ -3,7 +3,7 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 import sympy as sp
-
+import open3d as o3d
 from scipy.linalg import expm
 
 import time, csv, os, copy
@@ -36,7 +36,7 @@ class RobotEnv:
             self.observables = observables
         else:
             self.observables = ['p', 'pd', 'R', 'Rd', 'x_tf', 'x_ti', 'Fe', 'Fe_raw', 'Fd', 'rho']
-        self.demo_recorder = BoltTrajectoryRecorder(save_dir="./bolt_demos_random_start")
+        self.demo_recorder = BoltTrajectoryRecorder(save_dir="./bolt_demos_vis_random_start")
         self.fz = fz
         self.fix_camera = fix_camera
         self.fz_mode = "other"
@@ -45,6 +45,25 @@ class RobotEnv:
         self.writer1 = SummaryWriter('./gufic/logs1')
         self.writer2 = SummaryWriter('./gufic/logs2')
 
+        # ==============================
+        # Point cloud camera settings
+        # ==============================
+        self.vis_point = False
+        self.camera_name = "eye_in_hand"   # 你 XML 里末端相机的名字
+        self.cam_id = -1
+
+        self.rgb_renderer = None
+        self.depth_renderer = None
+
+        self.cam_height = 128
+        self.cam_width = 128
+        self.num_points = 4096
+
+        self.camera_matrix = np.eye(3, dtype=np.float32)
+        self.camera_matrix_inv = np.eye(3, dtype=np.float32)
+
+        # 每几步采集一次；1 表示每一帧都采集
+        self.pointcloud_capture_every = 1
         print('==============================================')
         print('USING GEOMETRIC UNIFED FORCE IMPEDANCE CONTROL')
         print('==============================================')
@@ -104,6 +123,7 @@ class RobotEnv:
 
         # Need to change self.sim with self.data 
         self.data = mujoco.MjData(self.model)
+        self.init_camera_renderer()
         if self.show_viewer:
             self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
             if self.fix_camera:
@@ -117,6 +137,154 @@ class RobotEnv:
         else:
             self.viewer = None
 
+    def init_camera_renderer(self):
+        """
+        初始化 RGB 和 Depth renderer，并计算相机内参。
+        """
+        self.cam_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_CAMERA,
+            self.camera_name
+        )
+
+        if self.cam_id < 0:
+            raise ValueError(f"Camera '{self.camera_name}' not found in XML.")
+
+        self.rgb_renderer = mujoco.Renderer(
+            self.model,
+            height=self.cam_height,
+            width=self.cam_width
+        )
+
+        self.depth_renderer = mujoco.Renderer(
+            self.model,
+            height=self.cam_height,
+            width=self.cam_width
+        )
+        self.depth_renderer.enable_depth_rendering()
+
+        # MuJoCo cam_fovy 单位是 degree
+        fovy = np.deg2rad(self.model.cam_fovy[self.cam_id])
+
+        fy = self.cam_height / (2.0 * np.tan(fovy / 2.0))
+        fx = fy
+        cx = self.cam_width / 2.0
+        cy = self.cam_height / 2.0
+
+        self.camera_matrix = np.array([
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0]
+        ], dtype=np.float32)
+
+        self.camera_matrix_inv = np.linalg.inv(self.camera_matrix).astype(np.float32)
+
+        print(f"[Camera] name={self.camera_name}, id={self.cam_id}, fovy={np.rad2deg(fovy):.2f}")
+        print(f"[Camera] K=\n{self.camera_matrix}")
+
+
+    def get_camera_rgbd(self):
+        """
+        从指定相机采集 RGB 和深度图。
+        """
+        self.rgb_renderer.update_scene(self.data, camera=self.cam_id)
+        rgb = self.rgb_renderer.render()
+
+        self.depth_renderer.update_scene(self.data, camera=self.cam_id)
+        depth = self.depth_renderer.render()
+
+        return rgb, depth
+
+
+    def rgbd_to_point_cloud(self, rgb, depth):
+        """
+        将 RGB-D 图像反投影为点云。
+        输出 shape: [N, 6]，每个点为 [x, y, z, r, g, b]
+        注意：这里的 xyz 是相机坐标系下的点云。
+        """
+        H, W = depth.shape
+        u, v = np.meshgrid(np.arange(W), np.arange(H))
+
+        ones = np.ones_like(u, dtype=np.float32)
+        pixels = np.stack([u, v, ones], axis=-1).reshape(-1, 3).astype(np.float32)
+
+        z = depth.reshape(-1, 1).astype(np.float32)
+
+        xyz = (pixels @ self.camera_matrix_inv.T) * z
+        rgb_flat = rgb.reshape(-1, 3).astype(np.float32)
+
+        point_cloud = np.concatenate([xyz, rgb_flat], axis=1)
+
+        # 过滤无效点和过远点
+        valid = np.isfinite(point_cloud).all(axis=1)
+        valid &= point_cloud[:, 2] > 0.0
+        valid &= point_cloud[:, 2] < 0.3
+
+        point_cloud = point_cloud[valid]
+
+        return self.uniform_sample_point_cloud(point_cloud)
+
+
+    def uniform_sample_point_cloud(self, point_cloud):
+        """
+        随机采样固定数量点。
+        如果有效点不足，则允许重复采样。
+        """
+        if point_cloud.shape[0] == 0:
+            return np.zeros((self.num_points, 6), dtype=np.float32)
+
+        replace = point_cloud.shape[0] < self.num_points
+        idx = np.random.choice(
+            point_cloud.shape[0],
+            size=self.num_points,
+            replace=replace
+        )
+
+        return point_cloud[idx].astype(np.float32)
+
+
+    def capture_point_cloud(self):
+        """
+        采集当前帧点云。
+        """
+        rgb, depth = self.get_camera_rgbd()
+        point_cloud = self.rgbd_to_point_cloud(rgb, depth)
+        return point_cloud
+
+    def visualize_point_cloud_once(self):
+        """
+        采集当前相机的一帧点云并用 Open3D 可视化。
+        点云格式：[x, y, z, r, g, b]
+        """
+        point_cloud = self.capture_point_cloud()
+
+        if point_cloud is None or point_cloud.shape[0] == 0:
+            print("[PointCloud] Empty point cloud.")
+            return
+
+        xyz = point_cloud[:, :3]
+        rgb = point_cloud[:, 3:] / 255.0
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz)
+        pcd.colors = o3d.utility.Vector3dVector(rgb)
+
+        print("[PointCloud] shape:", point_cloud.shape)
+        print("[PointCloud] xyz min:", xyz.min(axis=0))
+        print("[PointCloud] xyz max:", xyz.max(axis=0))
+
+        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=0.1,
+            origin=[0, 0, 0]
+        )
+
+        o3d.visualization.draw_geometries(
+            [pcd, frame],
+            window_name="Eye-in-hand Point Cloud",
+            width=960,
+            height=720
+        )
+    
     def reset(self, angle_prefix = None):
         self.iter = 0 
 
@@ -271,7 +439,9 @@ class RobotEnv:
 
             if i % 1000 == 0:
                 print(f"Time Step: {i}")
-
+            # 测试单帧点云
+            if self.vis_point and i == 1000:
+                self.visualize_point_cloud_once()
             if done:
                 break
 
@@ -549,6 +719,11 @@ class RobotEnv:
 
         t = self.iter * self.dt
 
+        if self.iter % self.pointcloud_capture_every == 0:
+            point_cloud = self.capture_point_cloud()
+        else:
+            point_cloud = None
+
         self.demo_recorder.add(
             t=self.iter * self.dt,
             p=p,
@@ -556,6 +731,7 @@ class RobotEnv:
             Vd_star=np.asarray(Vd_star).reshape(6),
             dVd_star=np.asarray(dVd_star).reshape(6),
             Fe=np.asarray(Fe).reshape(6),
+            point_cloud=point_cloud,
         )
 
         gd_t = np.eye(4)
@@ -754,7 +930,7 @@ if __name__ == "__main__":
     RE = RobotEnv(robot_name, show_viewer = show_viewer, max_time = max_time, fz = 10, 
                   fix_camera = True, task = task, randomized_start=randomized_start, inertia_shaping = inertia_shaping)
     
-    for episode in range(300, 400):
+    for episode in range(0, 200):
         RE.reset()
         RE.run()
         RE.demo_recorder.save(f"bolt_demo_{episode:04d}")

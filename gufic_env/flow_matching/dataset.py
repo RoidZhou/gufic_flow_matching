@@ -103,11 +103,13 @@ class RollingForceHistoryFMDataset(Dataset):
         self,
         demo_dir,
         x_hist_len=1,
+        pc_hist_len=1,
         force_hist_len=16,
         pred_horizon=100,
         stride=5,
         normalize_v=True,
         cond_stats=None,
+        use_pc_color=False,
         eps=1e-6,
     ):
         self.samples = []
@@ -116,6 +118,7 @@ class RollingForceHistoryFMDataset(Dataset):
         self.pred_horizon = pred_horizon
         self.normalize_v = normalize_v
         self.eps = eps
+        self.use_pc_color = use_pc_color
 
         demo_files = sorted(glob.glob(os.path.join(demo_dir, "*.npz")))
         if len(demo_files) == 0:
@@ -125,6 +128,7 @@ class RollingForceHistoryFMDataset(Dataset):
         all_R = []
         all_Fe = []
         all_v = []
+        all_pc = []
 
         for f in demo_files:
             data = np.load(f)
@@ -136,17 +140,22 @@ class RollingForceHistoryFMDataset(Dataset):
                 raise ValueError(f"Vd_star not found in {f}")
             if "Fe" not in data:
                 raise ValueError(f"Fe not found in {f}")
+            if "point_cloud" not in data:
+                raise ValueError(f"point_cloud not found in {f}")
+            
             p = data["p"].astype(np.float32)       # [T,3]
             R = data["R"].astype(np.float32)       # [T,3]
             R6d = rotmat_batch_to_rot6d(R)                        # [T,6]
             fe = data["Fe"].astype(np.float32)       # [T,6]
             v = data["Vd_star"].astype(np.float32)   # [T,6]
+            pc = data["point_cloud"].astype(np.float32)   # [T,6]
 
             T = len(v)
             all_p.append(p)
             all_R.append(R6d)
             all_Fe.append(fe)
             all_v.append(v)
+            all_pc.append(pc)
 
             # 需要至少有 K 步历史 + H 步未来
             # start_k = force_hist_len - 1
@@ -156,9 +165,11 @@ class RollingForceHistoryFMDataset(Dataset):
                 fe_left = max(0, k - force_hist_len + 1)
                 p_left = max(0, k - x_hist_len + 1)
                 R_left = max(0, k - x_hist_len + 1)
+                pc_left = max(0, k - pc_hist_len + 1)
                 fe_hist = fe[fe_left : k + 1]      # [K,6]
                 p_hist = p[p_left : k + 1]      # [K,6]
                 R_hist = R6d[R_left : k + 1]      # [K,6]
+                pc_hist = pc[R_left : k + 1]      # [K,6]
                 if fe_hist.shape[0] < force_hist_len:
                     # 如果不足 K 步历史，就在前面补零
                     pad_len = force_hist_len - fe_hist.shape[0]
@@ -170,11 +181,17 @@ class RollingForceHistoryFMDataset(Dataset):
                     pad_R = np.repeat(R_hist[0:1], pad_len, axis=0)
                     p_hist = np.concatenate([pad_p, p_hist], axis=0)
                     R_hist = np.concatenate([pad_R, R_hist], axis=0)
+                if pc_hist.shape[0] < pc_hist_len:
+                    pad_len = pc_hist_len - pc_hist.shape[0]
+                    pad_pc = np.repeat(pc_hist[0:1], pad_len, axis=0)
+                    pc_hist = np.concatenate([pad_pc, pc_hist], axis=0)
+
                 v_future = v[k + 1 : k + 1 + pred_horizon]        # [H,6]
 
                 self.samples.append({
                     "p_hist_raw":p_hist,
                     "R_hist_raw":R_hist,
+                    "pc_hist_raw": pc_hist,
                     "fe_hist_raw": fe_hist,
                     "v_future_raw": v_future,
                 })
@@ -245,6 +262,8 @@ class RollingForceHistoryFMDataset(Dataset):
                 s["R_hist"] = s["R_hist_raw"].astype(np.float32)
                 s["fe_hist"] = s["fe_hist_raw"].astype(np.float32)
                 s["v_future"] = s["v_future_raw"].astype(np.float32)
+            
+            s["pc_hist"] = s["pc_hist_raw"].astype(np.float32)
 
         print(f"[RollingForceHistoryFMDataset] samples = {len(self.samples)}")
         print(f"[RollingForceHistoryFMDataset] K = {force_hist_len}, H = {pred_horizon}")
@@ -263,8 +282,13 @@ class RollingForceHistoryFMDataset(Dataset):
         x_hist_flat = np.concatenate([p_hist_flat, R_hist_flat], axis=-1)   # [12K]
         cond_hist = np.concatenate([x_hist_flat, fe_hist_flat], axis=-1)   # [12K]
 
+        if self.use_pc_color:
+            s["pc_hist"] = s["pc_hist"]
+        else:
+            s["pc_hist"] = s["pc_hist"][:,:,:3]
         return (
             torch.from_numpy(cond_hist.astype(np.float32)),   # [6K]
+            torch.from_numpy(s["pc_hist"].astype(np.float32)),  # [H,6]
             torch.from_numpy(s["v_future"].astype(np.float32)),  # [H,6]
         )
 

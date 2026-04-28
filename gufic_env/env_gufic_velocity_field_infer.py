@@ -124,7 +124,8 @@ class RobotEnv:
         record_demos=False,
         demo_save_dir="./bolt_demos",
         seed=None,
-        save_tensorboard=False
+        save_tensorboard=False,
+        test_offline_cond=False,
     ):
         self.robot_name = robot_name
         self.task = task
@@ -132,7 +133,7 @@ class RobotEnv:
         self.inertia_shaping = inertia_shaping
         self.policy = model
         self.save_tensorboard = save_tensorboard
-        self.test_offline_cond = False
+        self.test_offline_cond = test_offline_cond
 
         if observables is not None:
             self.observables = observables
@@ -991,9 +992,13 @@ class RobotEnv:
 if __name__ == "__main__":
     robot_name = 'indy7'
     show_viewer = True
-    randomized_start = False
+    randomized_start = True
     inertia_shaping = False
     task = 'sphere'
+    if randomized_start:
+        type = "random_start"
+    else:
+        type = "fixed_start"
         
     # ============================================================
     # Flow Matching version or Regressive version
@@ -1008,7 +1013,7 @@ if __name__ == "__main__":
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm/fm_best.pt"
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_transformer_fixed_start/fm_best_0.025.pt"
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_transformer_fixed_start/fm_best_4.21.pt"
-    ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_pRFe_fixed_start/cfm_transformer_pRFe_norm_best.pt"
+    ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_pRFe_{type}/cfm_transformer_{type}_best.pt"
 
     assert task in ['regulation', 'circle', 'line', 'sphere']
 
@@ -1043,6 +1048,7 @@ if __name__ == "__main__":
         demo_save_dir="./bolt_demos_fm_runtime",
         seed=42,
         save_tensorboard=True,
+        test_offline_cond=False
     )
 
     RE.run()

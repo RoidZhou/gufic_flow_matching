@@ -9,6 +9,7 @@ from config import TrainConfig
 from cfm import CurvedPathCFM
 import csv
 from datetime import datetime
+from diffusion_model.vision.pointnet import PointNetBackbone
 
 def set_seed(seed: int) -> None:
     import random
@@ -194,6 +195,7 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
     train_dataset = RollingForceHistoryFMDataset(
         demo_dir=cfg.train_demo_dir,
         x_hist_len=cfg.x_hist_len,
+        pc_hist_len=cfg.pc_hist_len,
         force_hist_len=cfg.force_hist_len,
         pred_horizon=cfg.pred_horizon,
         stride=cfg.stride,
@@ -205,6 +207,7 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
     val_dataset = RollingForceHistoryFMDataset(
         demo_dir=cfg.val_demo_dir,
         x_hist_len=cfg.x_hist_len,
+        pc_hist_len=cfg.pc_hist_len,
         force_hist_len=cfg.force_hist_len,
         pred_horizon=cfg.pred_horizon,
         stride=cfg.stride,
@@ -227,6 +230,12 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         pin_memory=True,
     )
 
+    obs_encoder = PointNetBackbone(    
+        embed_dim= cfg.embed_dim,
+        input_channels= cfg.input_channels,
+        input_transform= cfg.input_transform,
+        ).to(device)
+
     model = VelocityFMTransformer(
         x_dim=6,
         cond_dim=cfg.cond_dim,   # = 6*K
@@ -237,10 +246,11 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
     ).to(device)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        list(model.parameters()) + list(obs_encoder.parameters()),
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
     )
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=cfg.epochs,
@@ -253,14 +263,17 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         model.train()
         train_sum, train_count = 0.0, 0
 
-        for cond_hist, v_future in train_loader:
+        for cond_hist, pc_hist, v_future in train_loader:
             cond_hist_flat = cond_hist.to(device).float()           # [B, 6K]
+            pc_hist = pc_hist.to(device).float()           # [B, 6K]
             v_future = v_future.to(device).float()           # [B, H, 6]
 
             # FM tuple on future velocity trajectory
             _, x1, t, xt, ut = path_sampler.sample_training_tuple(v_future)
 
-            pred = model(xt, t, cond_hist_flat)                # 条件 = 最近 K 步力历史
+            point_feat = obs_encoder(pc_hist)
+            cond_hist = torch.cat([cond_hist_flat, point_feat], dim=-1)                  # [B, embed_dim]
+            pred = model(xt, t, cond_hist)                # 条件 = 最近 K 步力历史
             loss = F.mse_loss(pred, ut)
 
             optimizer.zero_grad()
@@ -268,7 +281,7 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
 
-            bs = cond_hist_flat.shape[0]
+            bs = cond_hist.shape[0]
             train_sum += loss.item() * bs
             train_count += bs
 
@@ -278,16 +291,19 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         model.eval()
         val_sum, val_count = 0.0, 0
         with torch.no_grad():
-            for cond_hist_flat, v_future in val_loader:
+            for cond_hist_flat, pc_hist, v_future in val_loader:
                 cond_hist_flat = cond_hist_flat.to(device).float()
+                pc_hist = pc_hist.to(device).float()           # [B, 6K]
                 v_future = v_future.to(device).float()
 
                 _, x1, t, xt, ut = path_sampler.sample_training_tuple(v_future)
-
-                pred = model(xt, t, cond_hist_flat)
+                point_feat = obs_encoder(pc_hist)
+                cond_hist = torch.cat([cond_hist_flat, point_feat], dim=-1)                  # [B, embed_dim]
+                
+                pred = model(xt, t, cond_hist)
                 loss = F.mse_loss(pred, ut)
 
-                bs = cond_hist_flat.shape[0]
+                bs = cond_hist.shape[0]
                 val_sum += loss.item() * bs
                 val_count += bs
 
@@ -313,11 +329,11 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         print(f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
 
 if __name__ == "__main__":
-    type = "fixed_start"
-    # type = "random_start"
+    # type = "fixed_start"
+    type = "random_start"
     
-    cfg = TrainConfig(train_demo_dir="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos",
-                        val_demo_dir="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos",
+    cfg = TrainConfig(train_demo_dir="/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo",
+                        val_demo_dir="/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo",
                         type=type,
                         epochs=1000, 
                         batch_size=8, 
