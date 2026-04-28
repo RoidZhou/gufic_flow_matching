@@ -8,7 +8,7 @@ import torch.nn as nn
 from gufic_env.flow_matching.model import VelocityFMMLP, VelocityFMTransformer, VelocityFMCondUnet1D
 from gufic_env.flow_matching.config import TrainConfig
 from gufic_env.flow_matching.dataset import rotmat_batch_to_rot6d
-
+from diffusion_model.vision.pointnet import PointNetBackbone
 # ============================================================
 # Config / checkpoint loading
 # ============================================================
@@ -64,6 +64,14 @@ def load_model(ckpt_path, device="cuda"):
     model.load_state_dict(ckpt["model"])
     model.eval()
 
+    obs_encoder = PointNetBackbone(
+        embed_dim=cfg.embed_dim,
+        input_channels=cfg.input_channels,
+        input_transform=cfg.input_transform,
+    ).to(device)
+    obs_encoder.load_state_dict(ckpt["obs_encoder"])
+    obs_encoder.eval()
+
     stats = ckpt.get("cond_stats", None)
     if stats is None:
         raise ValueError("Checkpoint 中没有找到 stats，请先在训练保存时把 v_mean / v_std 一起存进去。")
@@ -71,7 +79,7 @@ def load_model(ckpt_path, device="cuda"):
     if "v_mean" not in stats or "v_std" not in stats:
         raise ValueError("stats 里必须包含 'v_mean' 和 'v_std'。")
 
-    return model, cfg, ckpt, stats
+    return model, obs_encoder, cfg, ckpt, stats
 
 
 # ============================================================
@@ -113,6 +121,7 @@ def load_one_demo(npz_path):
 @torch.no_grad()
 def sample_velocity_trajectory(
     model,
+    obs_encoder,
     traj_len,
     stats,
     device="cuda",
@@ -121,6 +130,7 @@ def sample_velocity_trajectory(
     seed=None,
     cfg=None,
     cond=None,
+    cond_pc=None
 ):
     """
     条件 / 无条件 FM 采样
@@ -205,7 +215,7 @@ def sample_velocity_trajectory(
 
         # 可选检查
         if hasattr(cfg, "cond_dim"):
-            if fe_cond.shape[-1] != cfg.cond_dim:
+            if fe_cond.shape[-1] != cfg.cond_dim-cfg.embed_dim:
                 raise ValueError(
                     f"cond 维度不匹配: got {fe_cond.shape[-1]}, expected {cfg.cond_dim}"
                 )
@@ -228,9 +238,11 @@ def sample_velocity_trajectory(
         )
 
         if use_cond:
+            pc_feat = obs_encoder(cond_pc)   # [1, embed_dim]
+            cond = torch.cat([fe_cond, pc_feat], dim=-1)  # [1, cond_dim]
             # Transformer forward 支持 fe: [B, cond_dim]
             # 内部会自动扩成 [B, T, cond_dim]
-            u_pred = model(x_t=v_t, t=t_value, fe=fe_cond)   # [1, T, 6]
+            u_pred = model(x_t=v_t, t=t_value, fe=cond)   # [1, T, 6]
         else:
             u_pred = model(x_t=v_t, t=t_value)               # [1, T, 6]
 
@@ -459,7 +471,7 @@ def run_direct_field_inference(
     os.makedirs(out_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model, cfg, ckpt, stats = load_model(ckpt_path, device=device)
+    model, obs_encoder, cfg, ckpt, stats = load_model(ckpt_path, device=device)
 
     demo = load_one_demo(demo_path)
 
@@ -512,6 +524,8 @@ def run_direct_field_inference(
         for i in range(len(demo["v"])-1):
             fe_left = max(0, i-cfg.force_hist_len+1)
             x_left = max(0, i - cfg.x_hist_len + 1)
+            pc_left = max(0, i - cfg.pc_hist_len + 1)
+
             cond_fe = demo["fe"][fe_left : i + 1]      # [K,6]，滚动取最近 K 步力作为条件
             # 对 fe 做归一化
             cond_fe = normalize_data(cond_fe, stats, "fe").astype(np.float32)
@@ -525,20 +539,28 @@ def run_direct_field_inference(
             R6d = normalize_data(R6d, stats, "R").astype(np.float32)
             cond_x = np.concatenate([p, R6d], axis=-1)        # [T,9]
 
+            cond_pc = demo["point_cloud"][pc_left : i + 1].astype(np.float32)
+            
             if cond_fe.shape[0] < cfg.force_hist_len:
                 # 如果不足 K 步历史，就在前面补零
                 pad_len = cfg.force_hist_len - cond_fe.shape[0]
                 cond_fe = np.pad(cond_fe, ((pad_len, 0), (0, 0)), mode="constant")
             if cond_x.shape[0] < cfg.x_hist_len:
-                # 如果整个序列都不足 K 步，就在前面补零
+                # 如果整个序列都不足 K 步，就在前面补x
                 pad_len = cfg.x_hist_len - cond_x.shape[0]
                 pad = np.repeat(cond_x[0:1], pad_len, axis=0)
                 cond_x = np.concatenate([pad, cond_x], axis=0)
+            if cond_pc.shape[0] < cfg.pc_hist_len:
+                # 如果整个序列都不足 K 步，就在前面补pc
+                pad_len = cfg.pc_hist_len - cond_pc.shape[0]
+                pad_pc = np.repeat(cond_pc[0:1], pad_len, axis=0)
+                cond_pc = np.concatenate([pad_pc, cond_pc], axis=0)
 
             cond = np.concatenate([cond_x.reshape(1, -1), cond_fe.reshape(1, -1)], axis=-1)
 
             result = sample_velocity_trajectory(
                 model=model,
+                obs_encoder=obs_encoder,
                 traj_len=traj_len,
                 stats=stats,
                 device=device,
@@ -547,6 +569,7 @@ def run_direct_field_inference(
                 seed=seed,
                 cfg=cfg,
                 cond=cond,
+                cond_pc=cond_pc,
             )
             
             v_sample_final.append(result["v_sample_final"][0:cfg.stride,:])
@@ -657,9 +680,9 @@ if __name__ == "__main__":
     type = "random_start"
 
     run_direct_field_inference(
-        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_pRFe_{type}/cfm_transformer_{type}_best2.pt",
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_{type}_best.pt",
         demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos/bolt_demo_0000.npz",
-        out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_pRFe_{type}",
+        out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_vis_pRFe_{type}",
         max_points=10000,
         steps=10,
         seed=42,

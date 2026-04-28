@@ -314,6 +314,7 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
             torch.save(
                 {
                     "model": model.state_dict(),
+                    "obs_encoder": obs_encoder.state_dict(),
                     "train_cfg": cfg.__dict__,
                     "best_loss": best_loss,
                     "cond_stats": cond_stats,
