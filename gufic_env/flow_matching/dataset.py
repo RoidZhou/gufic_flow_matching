@@ -6,7 +6,8 @@ from torch.utils.data import Dataset, DataLoader
 import math
 import matplotlib.pyplot as plt
 import glob
-import os   
+import os
+from tqdm.auto import tqdm  
 
 def rotmat_batch_to_rot6d(R: np.ndarray) -> np.ndarray:
     """
@@ -91,14 +92,6 @@ class FlowMatchingDataset(Dataset):
         return self.stats
 
 class RollingForceHistoryFMDataset(Dataset):
-    """
-    每个样本:
-      fe_hist:  [K, 6]
-      v_future: [H, 6]
-
-    训练目标:
-      用最近 K 步力序列作为条件，生成未来 H 步速度场
-    """
     def __init__(
         self,
         demo_dir,
@@ -130,8 +123,13 @@ class RollingForceHistoryFMDataset(Dataset):
         all_v = []
         all_pc = []
 
-        for f in demo_files:
-            data = np.load(f)
+        for f in tqdm(demo_files, desc="Loading demo files", ncols=100):
+            try:
+                data = np.load(f)
+            except Exception as e:
+                print(f"[Dataset] Skip bad file: {f}, error: {e}")
+                continue
+
             if "p" not in data:
                 raise ValueError(f"p not found in {f}")
             if "R" not in data:
@@ -142,13 +140,13 @@ class RollingForceHistoryFMDataset(Dataset):
                 raise ValueError(f"Fe not found in {f}")
             if "point_cloud" not in data:
                 raise ValueError(f"point_cloud not found in {f}")
-            
-            p = data["p"].astype(np.float32)       # [T,3]
-            R = data["R"].astype(np.float32)       # [T,3]
-            R6d = rotmat_batch_to_rot6d(R)                        # [T,6]
-            fe = data["Fe"].astype(np.float32)       # [T,6]
-            v = data["Vd_star"].astype(np.float32)   # [T,6]
-            pc = data["point_cloud"].astype(np.float32)   # [T,6]
+
+            p = data["p"].astype(np.float32)
+            R = data["R"].astype(np.float32)
+            R6d = rotmat_batch_to_rot6d(R)
+            fe = data["Fe"].astype(np.float32)
+            v = data["Vd_star"].astype(np.float32)
+            pc = data["point_cloud"].astype(np.float32)
 
             T = len(v)
             all_p.append(p)
@@ -157,40 +155,45 @@ class RollingForceHistoryFMDataset(Dataset):
             all_v.append(v)
             all_pc.append(pc)
 
-            # 需要至少有 K 步历史 + H 步未来
-            # start_k = force_hist_len - 1
             end_k = T - pred_horizon - 1
 
-            for k in range(0, end_k + 1, stride):
+            for k in tqdm(
+                range(0, end_k + 1, stride),
+                desc=f"Building samples: {os.path.basename(f)}",
+                leave=False,
+                ncols=100,
+            ):
                 fe_left = max(0, k - force_hist_len + 1)
                 p_left = max(0, k - x_hist_len + 1)
                 R_left = max(0, k - x_hist_len + 1)
                 pc_left = max(0, k - pc_hist_len + 1)
-                fe_hist = fe[fe_left : k + 1]      # [K,6]
-                p_hist = p[p_left : k + 1]      # [K,6]
-                R_hist = R6d[R_left : k + 1]      # [K,6]
-                pc_hist = pc[R_left : k + 1]      # [K,6]
+
+                fe_hist = fe[fe_left: k + 1]
+                p_hist = p[p_left: k + 1]
+                R_hist = R6d[R_left: k + 1]
+                pc_hist = pc[pc_left: k + 1]
+
                 if fe_hist.shape[0] < force_hist_len:
-                    # 如果不足 K 步历史，就在前面补零
                     pad_len = force_hist_len - fe_hist.shape[0]
                     fe_hist = np.pad(fe_hist, ((pad_len, 0), (0, 0)), mode="constant")
+
                 if p_hist.shape[0] < x_hist_len:
-                    # 如果整个序列都不足 K 步，就在前面补零
                     pad_len = x_hist_len - p_hist.shape[0]
                     pad_p = np.repeat(p_hist[0:1], pad_len, axis=0)
                     pad_R = np.repeat(R_hist[0:1], pad_len, axis=0)
                     p_hist = np.concatenate([pad_p, p_hist], axis=0)
                     R_hist = np.concatenate([pad_R, R_hist], axis=0)
+
                 if pc_hist.shape[0] < pc_hist_len:
                     pad_len = pc_hist_len - pc_hist.shape[0]
                     pad_pc = np.repeat(pc_hist[0:1], pad_len, axis=0)
                     pc_hist = np.concatenate([pad_pc, pc_hist], axis=0)
 
-                v_future = v[k + 1 : k + 1 + pred_horizon]        # [H,6]
+                v_future = v[k + 1: k + 1 + pred_horizon]
 
                 self.samples.append({
-                    "p_hist_raw":p_hist,
-                    "R_hist_raw":R_hist,
+                    "p_hist_raw": p_hist,
+                    "R_hist_raw": R_hist,
                     "pc_hist_raw": pc_hist,
                     "fe_hist_raw": fe_hist,
                     "v_future_raw": v_future,

@@ -28,6 +28,7 @@ class TrainConfig:
     time_dim: int = 64
 
     # pointnet
+    use_pc_color: bool = False
     embed_dim: int = 256
     input_channels: int = 3
     input_transform: bool = False

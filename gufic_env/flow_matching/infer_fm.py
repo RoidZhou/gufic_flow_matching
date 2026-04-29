@@ -8,7 +8,7 @@ import torch.nn as nn
 from gufic_env.flow_matching.model import VelocityFMMLP, VelocityFMTransformer, VelocityFMCondUnet1D
 from gufic_env.flow_matching.config import TrainConfig
 from gufic_env.flow_matching.dataset import rotmat_batch_to_rot6d
-from diffusion_model.vision.pointnet import PointNetBackbone
+from gufic_env.flow_matching.diffusion_model.vision.pointnet import PointNetBackbone
 # ============================================================
 # Config / checkpoint loading
 # ============================================================
@@ -107,6 +107,7 @@ def load_one_demo(npz_path):
         "p": data["p"].astype(np.float32),        # [T, 3]
         "R": data["R"].astype(np.float32),        # [T, 3, 3]
         "fe": data["Fe"].astype(np.float32),      # [T, 6]
+        "pc": data["point_cloud"].astype(np.float32),   # [T,6]
         "t": data["t"].astype(np.float32),            # [T]
         "total_time": float(data["total_time"][0]),
     }
@@ -130,7 +131,7 @@ def sample_velocity_trajectory(
     seed=None,
     cfg=None,
     cond=None,
-    cond_pc=None
+    cond_pc_np=None
 ):
     """
     条件 / 无条件 FM 采样
@@ -238,6 +239,8 @@ def sample_velocity_trajectory(
         )
 
         if use_cond:
+            cond_pc = torch.from_numpy(cond_pc_np).to(device).float()   # [1, cond_dim]
+            cond_pc = cond_pc.unsqueeze(0)   # [B, P, C]
             pc_feat = obs_encoder(cond_pc)   # [1, embed_dim]
             cond = torch.cat([fe_cond, pc_feat], dim=-1)  # [1, cond_dim]
             # Transformer forward 支持 fe: [B, cond_dim]
@@ -539,8 +542,10 @@ def run_direct_field_inference(
             R6d = normalize_data(R6d, stats, "R").astype(np.float32)
             cond_x = np.concatenate([p, R6d], axis=-1)        # [T,9]
 
-            cond_pc = demo["point_cloud"][pc_left : i + 1].astype(np.float32)
-            
+            if cfg.use_pc_color:
+                cond_pc = demo["pc"][pc_left : i + 1].astype(np.float32)
+            else:
+                cond_pc = demo["pc"][pc_left : i + 1, :,  :3].astype(np.float32)
             if cond_fe.shape[0] < cfg.force_hist_len:
                 # 如果不足 K 步历史，就在前面补零
                 pad_len = cfg.force_hist_len - cond_fe.shape[0]
@@ -569,7 +574,7 @@ def run_direct_field_inference(
                 seed=seed,
                 cfg=cfg,
                 cond=cond,
-                cond_pc=cond_pc,
+                cond_pc_np=cond_pc,
             )
             
             v_sample_final.append(result["v_sample_final"][0:cfg.stride,:])
@@ -680,8 +685,8 @@ if __name__ == "__main__":
     type = "random_start"
 
     run_direct_field_inference(
-        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_{type}_best.pt",
-        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos/bolt_demo_0000.npz",
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_{type}_best2.pt",
+        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo/bolt_demo_0000.npz",
         out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_vis_pRFe_{type}",
         max_points=10000,
         steps=10,
