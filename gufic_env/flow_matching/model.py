@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import math
 from gufic_env.flow_matching.diffusion_model.diffusion.conditional_unet1d import ConditionalUnet1D
-
+from gufic_env.flow_matching.diffusion_model.vision.pointnet import PointNetBackbone
 # ============================================================
 # Model
 # 输入: x_t, t, x1
@@ -251,6 +251,42 @@ class VelocityFMTransformer(nn.Module):
 
         return out
 
+class VisionDeltaPoseNet(nn.Module):
+    def __init__(self, state_dim=9, guide_dim=16, embed_dim=256, input_channels=3, input_transform=False):
+        super().__init__()
+        self.pointnet = PointNetBackbone(
+            embed_dim= embed_dim,
+            input_channels= input_channels,
+            input_transform= input_transform,
+        )
+
+        self.backbone = nn.Sequential(
+            nn.Linear(embed_dim + state_dim, 256),
+            nn.Mish(),
+            nn.Linear(256, 128),
+            nn.Mish(),
+        )
+
+        self.delta_head = nn.Linear(128, 9)   # Δp(3) + ΔR6d(6)
+
+        self.guide_proj = nn.Sequential(
+            nn.Linear(128 + 9, 64),
+            nn.Mish(),
+            nn.Linear(64, guide_dim),
+        )
+
+    def forward(self, pc_now, x_now):
+        """
+        pc_now: [B, P, 3]
+        x_now:  [B, 9]
+        """
+        pc_feat = self.pointnet(pc_now)   # [B,P,C]
+        h = self.backbone(torch.cat([pc_feat, x_now], dim=-1))           # [B,128]
+
+        delta_pose_pred = self.delta_head(h)                             # [B,9]
+        guide_feat = self.guide_proj(torch.cat([h, delta_pose_pred], dim=-1))  # [B,guide_dim]
+
+        return guide_feat, delta_pose_pred
 # ============================================================
 # Flow Matching Conditional Unet1D version
 # 输入:

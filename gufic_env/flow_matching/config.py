@@ -27,6 +27,11 @@ class TrainConfig:
     num_layers: int = 4
     time_dim: int = 64
 
+    # vision pose net
+    state_dim: int = 9
+    guide_dim: int = 16
+    lambda_delta: int = 0.1
+
     # pointnet
     use_pc_color: bool = False
     embed_dim: int = 64
@@ -37,7 +42,7 @@ class TrainConfig:
     x_hist_len: int = 1
     pc_hist_len: int =1
     force_hist_len: int = 16
-    cond_dim: int = 6 * 16 + 9 + embed_dim # K=16 步 6 维 力历史，1 步 9 维状态
+    cond_dim: int = 6 * 16 + 9 + guide_dim # K=16 步 6 维 力历史，1 步 9 维状态
     # cond_dim: int = 15 * 16        # K=16 步 6 维 力历史，16 步 9 维状态
 
     # 未来预测 horizon

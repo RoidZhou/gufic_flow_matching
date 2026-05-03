@@ -46,6 +46,28 @@ def uniform_sample_one_frame(point_cloud, num_points, use_xyz_only=True):
 
     return point_cloud[idx].astype(np.float32)
 
+def rotmat_to_rot6d_one(R: np.ndarray) -> np.ndarray:
+    """
+    R: [3,3]
+    return: [6]
+    """
+    R = np.asarray(R, dtype=np.float32).reshape(3, 3)
+    return R[:, :2].T.reshape(-1).astype(np.float32)
+
+def build_delta_pose_target(
+    p_now: np.ndarray,
+    R_now: np.ndarray,
+    p_next: np.ndarray,
+    R_next: np.ndarray,
+) -> np.ndarray:
+    """
+    return: [9] = [delta_p(3), delta_R6d(6)]
+    """
+    delta_p = (p_next - p_now).astype(np.float32)     # [3]
+    R_rel = R_now.T @ R_next                          # [3,3]
+    delta_r6d = rotmat_to_rot6d_one(R_rel)           # [6]
+    return np.concatenate([delta_p, delta_r6d], axis=0).astype(np.float32)
+
 class FlowMatchingDataset(Dataset):
     """
     相邻点对数据集
@@ -207,6 +229,7 @@ class RollingForceHistoryFMDataset(Dataset):
                 R_left = max(0, k - x_hist_len + 1)
                 pc_left = max(0, k - pc_hist_len + 1)
 
+                # 历史状态
                 fe_hist = fe[fe_left: k + 1]
                 p_hist = p[p_left: k + 1]
                 R_hist = R6d[R_left: k + 1]
@@ -228,9 +251,22 @@ class RollingForceHistoryFMDataset(Dataset):
                     pad_pc = np.repeat(pc_hist[0:1], pad_len, axis=0)
                     pc_hist = np.concatenate([pad_pc, pc_hist], axis=0)
 
+                # 当前状态
+                p_now = p[k].astype(np.float32)          # [3]
+                R_now = R[k].astype(np.float32)          # [3,3]
+                R6d_now = R6d[k].astype(np.float32)      # [6]
+
+                # 下一步状态，给视觉分支监督
+                p_next = p[k + 1].astype(np.float32)
+                R_next = R[k + 1].astype(np.float32)
+                delta_pose_target = build_delta_pose_target(p_now, R_now, p_next, R_next)  # [9]
+
                 v_future = v[k + 1: k + 1 + pred_horizon]
 
                 self.samples.append({
+                    # "p_now_raw": p_now,
+                    # "R6d_now_raw": R6d_now,
+                    "delta_pose_target": delta_pose_target,
                     "p_hist_raw": p_hist,
                     "R_hist_raw": R_hist,
                     "pc_hist_raw": pc_hist,
@@ -293,6 +329,12 @@ class RollingForceHistoryFMDataset(Dataset):
                 s["R_hist"] = (
                     (s["R_hist_raw"] - self.cond_stats["R_mean"]) / self.cond_stats["R_std"]
                 ).astype(np.float32)
+                # s["p_now"] = (
+                #     (s["p_now_raw"] - self.cond_stats["p_mean"]) / self.cond_stats["p_std"]
+                #     ).astype(np.float32)
+                # s["R6d_now"] = (
+                #     (s["R6d_now_raw"] - self.cond_stats["R_mean"]) / self.cond_stats["R_std"]
+                #     ).astype(np.float32)
                 s["fe_hist"] = (
                     (s["fe_hist_raw"] - self.cond_stats["fe_mean"]) / self.cond_stats["fe_std"]
                 ).astype(np.float32)
@@ -326,11 +368,16 @@ class RollingForceHistoryFMDataset(Dataset):
         fe_hist = s["fe_hist"]                    # [K,6]
         fe_hist_flat = fe_hist.reshape(-1)        # [6K]
         x_hist_flat = np.concatenate([p_hist_flat, R_hist_flat], axis=-1)   # [12K]
-        cond_hist = np.concatenate([x_hist_flat, fe_hist_flat], axis=-1)   # [12K]
 
+        # p_now = s["p_now"]
+        # R6d_now = s["R6d_now"]
+        # x_now = np.concatenate([p_now, R6d_now], axis=-1)
+        cond_hist = np.concatenate([x_hist_flat, fe_hist_flat], axis=-1)   # [12K]
         return (
             torch.from_numpy(cond_hist.astype(np.float32)),   # [6K]
+            # torch.from_numpy(x_now.astype(np.float32)),   # [6K]
             torch.from_numpy(s["pc_hist"].astype(np.float32)),  # [H,6]
+            torch.from_numpy(s["delta_pose_target"].astype(np.float32)),   # [9]
             torch.from_numpy(s["v_future"].astype(np.float32)),  # [H,6]
         )
 

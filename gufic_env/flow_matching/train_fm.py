@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from dataset import FlowMatchingDataset, RollingForceHistoryFMDataset
-from model import VelocityFMMLP, VelocityFMTransformer,VelocityFMCondUnet1D
+from model import VelocityFMMLP, VelocityFMTransformer,VelocityFMCondUnet1D, VisionDeltaPoseNet
 from config import TrainConfig
 from cfm import CurvedPathCFM
 import csv
@@ -232,7 +232,9 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         pin_memory=True,
     )
 
-    obs_encoder = PointNetBackbone(    
+    obs_encoder = VisionDeltaPoseNet(
+        state_dim=cfg.state_dim,
+        guide_dim=cfg.guide_dim,
         embed_dim= cfg.embed_dim,
         input_channels= cfg.input_channels,
         input_transform= cfg.input_transform,
@@ -265,18 +267,26 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         model.train()
         train_sum, train_count = 0.0, 0
 
-        for cond_hist, pc_hist, v_future in train_loader:
+        for cond_hist, pc_hist, delta_pose_target, v_future in train_loader:
             cond_hist_flat = cond_hist.to(device).float()           # [B, 6K]
-            pc_hist = pc_hist.to(device).float()           # [B, 6K]
+            pc_hist = pc_hist.to(device).float()           # [B, T, P, C]
+            # pc_hist = pc_hist.squeeze(1)          # [B, P, C]
+            delta_pose_target = delta_pose_target.to(device).float()  # [B,9]
             v_future = v_future.to(device).float()           # [B, H, 6]
+
+            # 当前状态 x_now 就是 cond_main 的前 9 维
+            x_now = cond_hist_flat[:, :9]
 
             # FM tuple on future velocity trajectory
             _, x1, t, xt, ut = path_sampler.sample_training_tuple(v_future)
+            guide_feat, delta_pose_pred = obs_encoder(pc_hist, x_now)   # [B,guide_dim], [B,9]
+            cond_hist = torch.cat([cond_hist_flat, guide_feat], dim=-1)         # [B, cond_dim]
 
-            point_feat = obs_encoder(pc_hist)
-            cond_hist = torch.cat([cond_hist_flat, point_feat], dim=-1)                  # [B, embed_dim]
             pred = model(xt, t, cond_hist)                # 条件 = 最近 K 步力历史
-            loss = F.mse_loss(pred, ut)
+
+            loss_fm = F.mse_loss(pred, ut)
+            loss_delta = F.smooth_l1_loss(delta_pose_pred, delta_pose_target)
+            loss = loss_fm + cfg.lambda_delta * loss_delta
 
             optimizer.zero_grad()
             loss.backward()
@@ -292,18 +302,27 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
 
         model.eval()
         val_sum, val_count = 0.0, 0
+        # 让 val 固定，减少波动
+        torch.manual_seed(1234)
+        torch.cuda.manual_seed_all(1234)
+
         with torch.no_grad():
-            for cond_hist_flat, pc_hist, v_future in val_loader:
+            for cond_hist_flat, pc_hist, delta_pose_target, v_future in val_loader:
                 cond_hist_flat = cond_hist_flat.to(device).float()
                 pc_hist = pc_hist.to(device).float()           # [B, 6K]
+                delta_pose_target = delta_pose_target.to(device).float()  # [B,9]
                 v_future = v_future.to(device).float()
+                # 当前状态 x_now 就是 cond_main 的前 9 维
+                x_now = cond_hist_flat[:, :9]
 
                 _, x1, t, xt, ut = path_sampler.sample_training_tuple(v_future)
-                point_feat = obs_encoder(pc_hist)
-                cond_hist = torch.cat([cond_hist_flat, point_feat], dim=-1)                  # [B, embed_dim]
+                guide_feat, delta_pose_pred = obs_encoder(pc_hist, x_now)   # [B,guide_dim], [B,9]
+                cond_hist = torch.cat([cond_hist_flat, guide_feat], dim=-1)         # [B, cond_dim]
                 
                 pred = model(xt, t, cond_hist)
-                loss = F.mse_loss(pred, ut)
+                loss_fm = F.mse_loss(pred, ut)
+                loss_delta = F.smooth_l1_loss(delta_pose_pred, delta_pose_target)
+                loss = loss_fm + cfg.lambda_delta * loss_delta
 
                 bs = cond_hist.shape[0]
                 val_sum += loss.item() * bs
