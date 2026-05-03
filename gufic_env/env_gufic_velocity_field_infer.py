@@ -20,8 +20,9 @@ from collections import deque
 import torch
 import torch.nn as nn
 # sys.path.append(r"/home/zhou/autolab/GUFIC_mujoco-main")
-
+import open3d as o3d
 from gufic_env.flow_matching.model import VelocityRegressiveMLP, VelocityFMTransformer, VelocityFMMLP, VelocityFMTransformer, VelocityFMCondUnet1D
+from gufic_env.flow_matching.diffusion_model.vision.pointnet import PointNetBackbone
 from gufic_env.flow_matching.dataset import rotmat_batch_to_rot6d
 from tensorboardX import SummaryWriter
 
@@ -140,7 +141,7 @@ class RobotEnv:
         else:
             self.observables = ['p', 'pd', 'R', 'Rd', 'x_tf', 'x_ti', 'Fe', 'Fe_raw', 'Fd', 'rho']
 
-        demo_path = "/home/zhou/autolab/GUFIC_mujoco-main/bolt_demos/bolt_demo_0000.npz"
+        demo_path = "/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo/bolt_demo_0000.npz"
         self.demo = load_one_demo(demo_path)
         self.fz = fz
         self.fix_camera = fix_camera
@@ -149,7 +150,26 @@ class RobotEnv:
         self.writer = SummaryWriter('./gufic/logs')
         self.writer1 = SummaryWriter('./gufic/logs1')
         self.writer2 = SummaryWriter('./gufic/logs2')
+        # ==============================
+        # Point cloud camera settings
+        # ==============================
+        self.vis_point = False
+        self.camera_name = "eye_in_hand"   # 你 XML 里末端相机的名字
+        self.cam_id = -1
 
+        self.rgb_renderer = None
+        self.depth_renderer = None
+
+        self.cam_height = 128
+        self.cam_width = 128
+        self.num_points = 2048
+
+        self.camera_matrix = np.eye(3, dtype=np.float32)
+        self.camera_matrix_inv = np.eye(3, dtype=np.float32)
+        self.pc_scale = 0.1
+        # 每几步采集一次；1 表示每一帧都采集
+        self.pointcloud_capture_every = 1
+        self.use_pc_color = False
         print('==============================================')
         print('USING GEOMETRIC UNIFED FORCE IMPEDANCE CONTROL')
         print('==============================================')
@@ -269,6 +289,7 @@ class RobotEnv:
             self.use_cond = train_cfg["use_cond"]
             self.force_hist_len = train_cfg["force_hist_len"]
             self.x_hist_len = train_cfg["x_hist_len"]
+            self.pc_hist_len = train_cfg["pc_hist_len"]
             self.pred_horizon = train_cfg["pred_horizon"]
             # self.steps = train_cfg.steps
             self.steps =10
@@ -294,6 +315,15 @@ class RobotEnv:
             
         self.velocity_model.load_state_dict(ckpt["model"])
         self.velocity_model.eval()
+
+        self.obs_encoder = PointNetBackbone(
+            embed_dim=train_cfg["embed_dim"],
+            input_channels=train_cfg["input_channels"],
+            input_transform=train_cfg["input_transform"],
+        ).to(self.fm_device)
+        self.obs_encoder.load_state_dict(ckpt["obs_encoder"])
+        self.obs_encoder.eval()
+
         print(f"[FM] loaded checkpoint from {self.fm_ckpt_path}")
         print(f"[FM] goal = {self.fm_goal}")
 
@@ -333,7 +363,7 @@ class RobotEnv:
         return x_t
 
     @torch.no_grad()
-    def get_learned_velocity_field(self, p, R, t, Fe):
+    def get_learned_velocity_field(self, p, R, t, Fe, point_cloud):
         if self.policy == 'mlp':
             """
             用训练好的速度场模型 infer:
@@ -393,6 +423,12 @@ class RobotEnv:
                 self.fe_queue.append(Fe.squeeze(0))
                 fe_cond = np.stack(list(self.fe_queue), axis=0)   # [n,6]
 
+                if self.use_pc_color:
+                    cond_pc = point_cloud.astype(np.float32)
+                else:
+                    cond_pc = point_cloud[:, :3].astype(np.float32)
+                cond_pc = cond_pc[None, :, :]   # [1, P, C]
+
                 if fe_cond.shape[0] < self.force_hist_len:
                     # 如果不足 K 步历史，就在前面补零
                     pad_len = self.force_hist_len - fe_cond.shape[0]
@@ -402,6 +438,11 @@ class RobotEnv:
                     pad_len = self.x_hist_len - cond_x.shape[0]
                     pad = np.repeat(cond_x[0:1], pad_len, axis=0)
                     cond_x = np.concatenate([pad, cond_x], axis=0)
+                if cond_pc.shape[0] < self.pc_hist_len:
+                    # 如果整个序列都不足 K 步，就在前面补pc
+                    pad_len = self.pc_hist_len - cond_pc.shape[0]
+                    pad_pc = np.repeat(cond_pc[0:1], pad_len, axis=0)
+                    cond_pc = np.concatenate([pad_pc, cond_pc], axis=0)
 
                 cond = np.concatenate([cond_x.reshape(1, -1), fe_cond.reshape(1, -1)], axis=-1)  # [1, cond_dim]
                 # cond: [K,6] -> [6K]
@@ -413,6 +454,10 @@ class RobotEnv:
                     cond = cond[None, :]
 
                 cond = torch.from_numpy(cond).to(self.fm_device).float()
+                cond_pc = torch.from_numpy(cond_pc).to(self.fm_device).float()
+                cond_pc = cond_pc.unsqueeze(0)   # [B, P, C]
+                pc_feat = self.obs_encoder(cond_pc)   # [1, embed_dim]
+                cond = torch.cat([cond, pc_feat], dim=-1)  # [1, cond_dim]
 
                 for i in range(self.steps):
                     # flow time，对整条轨迹共用一个标量
@@ -484,6 +529,7 @@ class RobotEnv:
 
         self.model = mujoco.MjModel.from_xml_path(model_path)
         self.data = mujoco.MjData(self.model)
+        self.init_camera_renderer()
         if self.show_viewer:
             self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
             if self.fix_camera:
@@ -496,6 +542,150 @@ class RobotEnv:
         else:
             self.viewer = None
 
+    def init_camera_renderer(self):
+        """
+        初始化 RGB 和 Depth renderer，并计算相机内参。
+        """
+        self.cam_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_CAMERA,
+            self.camera_name
+        )
+
+        if self.cam_id < 0:
+            raise ValueError(f"Camera '{self.camera_name}' not found in XML.")
+
+        self.rgb_renderer = mujoco.Renderer(
+            self.model,
+            height=self.cam_height,
+            width=self.cam_width
+        )
+
+        self.depth_renderer = mujoco.Renderer(
+            self.model,
+            height=self.cam_height,
+            width=self.cam_width
+        )
+        self.depth_renderer.enable_depth_rendering()
+
+        # MuJoCo cam_fovy 单位是 degree
+        fovy = np.deg2rad(self.model.cam_fovy[self.cam_id])
+
+        fy = self.cam_height / (2.0 * np.tan(fovy / 2.0))
+        fx = fy
+        cx = self.cam_width / 2.0
+        cy = self.cam_height / 2.0
+
+        self.camera_matrix = np.array([
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0]
+        ], dtype=np.float32)
+
+        self.camera_matrix_inv = np.linalg.inv(self.camera_matrix).astype(np.float32)
+
+        print(f"[Camera] name={self.camera_name}, id={self.cam_id}, fovy={np.rad2deg(fovy):.2f}")
+        print(f"[Camera] K=\n{self.camera_matrix}")
+
+    def get_camera_rgbd(self):
+        """
+        从指定相机采集 RGB 和深度图。
+        """
+        self.rgb_renderer.update_scene(self.data, camera=self.cam_id)
+        rgb = self.rgb_renderer.render()
+
+        self.depth_renderer.update_scene(self.data, camera=self.cam_id)
+        depth = self.depth_renderer.render()
+
+        return rgb, depth
+
+    def rgbd_to_point_cloud(self, rgb, depth):
+        """
+        将 RGB-D 图像反投影为点云。
+        输出 shape: [N, 6]，每个点为 [x, y, z, r, g, b]
+        注意：这里的 xyz 是相机坐标系下的点云。
+        """
+        H, W = depth.shape
+        u, v = np.meshgrid(np.arange(W), np.arange(H))
+
+        ones = np.ones_like(u, dtype=np.float32)
+        pixels = np.stack([u, v, ones], axis=-1).reshape(-1, 3).astype(np.float32)
+
+        z = depth.reshape(-1, 1).astype(np.float32)
+
+        xyz = (pixels @ self.camera_matrix_inv.T) * z
+        rgb_flat = rgb.reshape(-1, 3).astype(np.float32)
+
+        point_cloud = np.concatenate([xyz, rgb_flat], axis=1)
+
+        # 过滤无效点和过远点
+        valid = np.isfinite(point_cloud).all(axis=1)
+        valid &= point_cloud[:, 2] > 0.0
+        valid &= point_cloud[:, 2] < 0.3
+
+        point_cloud = point_cloud[valid]
+
+        return self.uniform_sample_point_cloud(point_cloud)
+
+    def uniform_sample_point_cloud(self, point_cloud):
+        """
+        随机采样固定数量点。
+        如果有效点不足，则允许重复采样。
+        """
+        if point_cloud.shape[0] == 0:
+            return np.zeros((self.num_points, 6), dtype=np.float32)
+
+        replace = point_cloud.shape[0] < self.num_points
+        idx = np.random.choice(
+            point_cloud.shape[0],
+            size=self.num_points,
+            replace=replace
+        )
+
+        return point_cloud[idx].astype(np.float32)
+
+    def capture_point_cloud(self):
+        """
+        采集当前帧点云。
+        """
+        rgb, depth = self.get_camera_rgbd()
+        point_cloud = self.rgbd_to_point_cloud(rgb, depth)
+        return point_cloud
+
+    def visualize_point_cloud_once(self):
+        """
+        采集当前相机的一帧点云并用 Open3D 可视化。
+        点云格式：[x, y, z, r, g, b]
+        """
+        point_cloud = self.capture_point_cloud()
+
+        if point_cloud is None or point_cloud.shape[0] == 0:
+            print("[PointCloud] Empty point cloud.")
+            return
+
+        xyz = point_cloud[:, :3]
+        rgb = point_cloud[:, 3:] / 255.0
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz)
+        pcd.colors = o3d.utility.Vector3dVector(rgb)
+
+        print("[PointCloud] shape:", point_cloud.shape)
+        print("[PointCloud] xyz min:", xyz.min(axis=0))
+        print("[PointCloud] xyz max:", xyz.max(axis=0))
+
+        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=0.1,
+            origin=[0, 0, 0]
+        )
+
+        o3d.visualization.draw_geometries(
+            [pcd, frame],
+            window_name="Eye-in-hand Point Cloud",
+            width=960,
+            height=720
+        )
+    
     def reset(self, angle_prefix=None):
         self.iter = 0
         self.prev_Vd_star_fm[:] = 0.0
@@ -797,12 +987,27 @@ class RobotEnv:
             cond_fe = Fe
             cond_p = p.reshape(1, -1)
             cond_R = R.reshape(1, 3, 3)
+        # pointcloud
+        if self.iter % self.pointcloud_capture_every == 0:
+            point_cloud = self.capture_point_cloud()
+            if self.use_pc_color:
+                point_cloud = point_cloud.astype(np.float32)
+            else:
+                point_cloud = point_cloud[:, :3].astype(np.float32)
+
+            pc_raw = point_cloud.astype(np.float32)
+            # pc_center = pc_raw.mean(axis=1, keepdims=True)   # 每帧中心化再缩放
+            # pc_decenter = pc_raw - pc_center
+            point_cloud = (pc_raw / self.pc_scale).astype(np.float32)
+            
+        else:
+            point_cloud = None
         # ======================================================
         # Source of desired velocity field
         # ======================================================
         current_t = self.iter * self.dt
         if self.use_learned_velocity_field:
-            Vd_star, dVd_star = self.get_learned_velocity_field(cond_p, cond_R, current_t, cond_fe)
+            Vd_star, dVd_star = self.get_learned_velocity_field(cond_p, cond_R, current_t, cond_fe, point_cloud)
         else:
             Vd_star, dVd_star = self.get_velocity_field(g, Vb.reshape((-1,)), t=current_t)
 
@@ -1013,7 +1218,7 @@ if __name__ == "__main__":
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm/fm_best.pt"
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_transformer_fixed_start/fm_best_0.025.pt"
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_transformer_fixed_start/fm_best_4.21.pt"
-    ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_pRFe_{type}/cfm_transformer_{type}_best.pt"
+    ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis_{type}_best8.pt"
 
     assert task in ['regulation', 'circle', 'line', 'sphere']
 

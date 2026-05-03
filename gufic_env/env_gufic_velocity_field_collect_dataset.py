@@ -48,7 +48,7 @@ class RobotEnv:
         # ==============================
         # Point cloud camera settings
         # ==============================
-        self.vis_point = False
+        self.vis_point = True
         self.camera_name = "eye_in_hand"   # 你 XML 里末端相机的名字
         self.cam_id = -1
 
@@ -97,8 +97,6 @@ class RobotEnv:
 
         # print("Gains:", self.Kp, self.KR, self.Kd, self.kp_force, self.kd_force, self.ki_force, self.zeta)
         # print(self.pd_t(0))
-
-
 
     def load_xml(self):
         # dir = "/home/joohwan/deeprl/research/GIC_Learning_public/"
@@ -182,7 +180,6 @@ class RobotEnv:
         print(f"[Camera] name={self.camera_name}, id={self.cam_id}, fovy={np.rad2deg(fovy):.2f}")
         print(f"[Camera] K=\n{self.camera_matrix}")
 
-
     def get_camera_rgbd(self):
         """
         从指定相机采集 RGB 和深度图。
@@ -194,7 +191,6 @@ class RobotEnv:
         depth = self.depth_renderer.render()
 
         return rgb, depth
-
 
     def rgbd_to_point_cloud(self, rgb, depth):
         """
@@ -224,7 +220,6 @@ class RobotEnv:
 
         return self.uniform_sample_point_cloud(point_cloud)
 
-
     def uniform_sample_point_cloud(self, point_cloud):
         """
         随机采样固定数量点。
@@ -241,7 +236,6 @@ class RobotEnv:
         )
 
         return point_cloud[idx].astype(np.float32)
-
 
     def capture_point_cloud(self):
         """
@@ -440,7 +434,7 @@ class RobotEnv:
             if i % 1000 == 0:
                 print(f"Time Step: {i}")
             # 测试单帧点云
-            if self.vis_point and i == 1000:
+            if self.vis_point and i % 2000 == 0:
                 self.visualize_point_cloud_once()
             if done:
                 break
@@ -930,7 +924,7 @@ if __name__ == "__main__":
     RE = RobotEnv(robot_name, show_viewer = show_viewer, max_time = max_time, fz = 10, 
                   fix_camera = True, task = task, randomized_start=randomized_start, inertia_shaping = inertia_shaping)
     
-    for episode in range(0, 200):
+    for episode in range(98, 200):
         RE.reset()
         RE.run()
         RE.demo_recorder.save(f"bolt_demo_{episode:04d}")

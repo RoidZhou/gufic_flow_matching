@@ -19,6 +19,33 @@ def rotmat_batch_to_rot6d(R: np.ndarray) -> np.ndarray:
     rot6d = R[:, :, :2].transpose(0, 2, 1).reshape(-1, 6)
     return rot6d.astype(np.float32)
 
+def uniform_sample_one_frame(point_cloud, num_points, use_xyz_only=True):
+    """
+    对单帧点云采样。
+    输入:
+        point_cloud: [N, C]
+    输出:
+        sampled_points: [num_points, C]
+    """
+    point_cloud = np.asarray(point_cloud, dtype=np.float32)
+
+    if use_xyz_only:
+        point_cloud = point_cloud[:, :3]
+
+    if point_cloud.shape[0] == 0:
+        C = 3 if use_xyz_only else point_cloud.shape[1]
+        return np.zeros((num_points, C), dtype=np.float32)
+
+    replace = point_cloud.shape[0] < num_points
+
+    idx = np.random.choice(
+        point_cloud.shape[0],
+        size=num_points,
+        replace=replace
+    )
+
+    return point_cloud[idx].astype(np.float32)
+
 class FlowMatchingDataset(Dataset):
     """
     相邻点对数据集
@@ -112,7 +139,7 @@ class RollingForceHistoryFMDataset(Dataset):
         self.normalize_v = normalize_v
         self.eps = eps
         self.use_pc_color = use_pc_color
-
+        self.pc_scale = 0.1
         demo_files = sorted(glob.glob(os.path.join(demo_dir, "*.npz")))
         if len(demo_files) == 0:
             raise ValueError(f"No demo files found in {demo_dir}")
@@ -147,6 +174,18 @@ class RollingForceHistoryFMDataset(Dataset):
             fe = data["Fe"].astype(np.float32)
             v = data["Vd_star"].astype(np.float32)
             pc = data["point_cloud"].astype(np.float32)
+            if self.use_pc_color:
+                pc = pc
+            else:
+                pc = pc[:,:,:3]
+            # 上采样
+            pc = np.stack(
+                [uniform_sample_one_frame(pc_t, 2048, use_xyz_only=True) for pc_t in pc],
+                axis=0
+            ).astype(np.float32)  # [T, 2048, 3]
+            # We shuffle the points, i.e. shuffle pcd along dim=2 (T, P, 3)
+            idx = torch.randperm(pc.shape[1])
+            pc = pc[:, idx, :]
 
             T = len(v)
             all_p.append(p)
@@ -260,13 +299,17 @@ class RollingForceHistoryFMDataset(Dataset):
                 s["v_future"] = (
                     (s["v_future_raw"] - self.cond_stats["v_mean"]) / self.cond_stats["v_std"]
                 ).astype(np.float32)
+                pc_raw = s["pc_hist_raw"].astype(np.float32)
+                # pc_center = pc_raw.mean(axis=1, keepdims=True)   # 每帧中心化再缩放
+                # pc_decenter = pc_raw - pc_center
+                s["pc_hist"] = (pc_raw / self.pc_scale).astype(np.float32)
+                # s["pc_hist"] = (s["pc_hist_raw"] / self.pc_scale).astype(np.float32) # 直接缩放
             else:
                 s["p_hist"] = s["p_hist_raw"].astype(np.float32)
                 s["R_hist"] = s["R_hist_raw"].astype(np.float32)
                 s["fe_hist"] = s["fe_hist_raw"].astype(np.float32)
                 s["v_future"] = s["v_future_raw"].astype(np.float32)
-            
-            s["pc_hist"] = s["pc_hist_raw"].astype(np.float32)
+                s["pc_hist"] = s["pc_hist_raw"].astype(np.float32)
 
         print(f"[RollingForceHistoryFMDataset] samples = {len(self.samples)}")
         print(f"[RollingForceHistoryFMDataset] K = {force_hist_len}, H = {pred_horizon}")
@@ -285,10 +328,6 @@ class RollingForceHistoryFMDataset(Dataset):
         x_hist_flat = np.concatenate([p_hist_flat, R_hist_flat], axis=-1)   # [12K]
         cond_hist = np.concatenate([x_hist_flat, fe_hist_flat], axis=-1)   # [12K]
 
-        if self.use_pc_color:
-            s["pc_hist"] = s["pc_hist"]
-        else:
-            s["pc_hist"] = s["pc_hist"][:,:,:3]
         return (
             torch.from_numpy(cond_hist.astype(np.float32)),   # [6K]
             torch.from_numpy(s["pc_hist"].astype(np.float32)),  # [H,6]

@@ -29,7 +29,7 @@ class TrainConfig:
 
     # pointnet
     use_pc_color: bool = False
-    embed_dim: int = 256
+    embed_dim: int = 64
     input_channels: int = 3
     input_transform: bool = False
 
