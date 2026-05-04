@@ -5,9 +5,9 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 
-from gufic_env.flow_matching.model import VelocityFMMLP, VelocityFMTransformer, VelocityFMCondUnet1D
+from gufic_env.flow_matching.model import VelocityFMMLP, VelocityFMTransformer, VelocityFMCondUnet1D, VisionDeltaPoseNet
 from gufic_env.flow_matching.config import TrainConfig
-from gufic_env.flow_matching.dataset import rotmat_batch_to_rot6d
+from gufic_env.flow_matching.dataset import rotmat_batch_to_rot6d, uniform_sample_one_frame
 from gufic_env.flow_matching.diffusion_model.vision.pointnet import PointNetBackbone
 # ============================================================
 # Config / checkpoint loading
@@ -30,7 +30,7 @@ def build_cfg_from_ckpt(ckpt_config: dict):
 def load_model(ckpt_path, device="cuda"):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-    ckpt_cfg = ckpt.get("config", {})
+    ckpt_cfg = ckpt.get("train_cfg", {})
     cfg = build_cfg_from_ckpt(ckpt_cfg)
 
     model_name = getattr(cfg, "model", "mlp")
@@ -64,11 +64,13 @@ def load_model(ckpt_path, device="cuda"):
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    obs_encoder = PointNetBackbone(
-        embed_dim=cfg.embed_dim,
-        input_channels=cfg.input_channels,
-        input_transform=cfg.input_transform,
-    ).to(device)
+    obs_encoder = VisionDeltaPoseNet(
+        state_dim=cfg.state_dim,
+        guide_dim=cfg.guide_dim,
+        embed_dim= cfg.embed_dim,
+        input_channels= cfg.input_channels,
+        input_transform= cfg.input_transform,
+        ).to(device)
     obs_encoder.load_state_dict(ckpt["obs_encoder"])
     obs_encoder.eval()
 
@@ -213,10 +215,12 @@ def sample_velocity_trajectory(
             raise ValueError(f"cond 期望形状为 [K,6] 或 [6*K]，当前是 {cond_np.shape}")
 
         fe_cond = torch.from_numpy(cond_np).to(device).float()   # [1, cond_dim]
+        # 当前状态 x_now 就是 cond_main 的前 9 维
+        x_now = fe_cond[:, :9]
 
         # 可选检查
         if hasattr(cfg, "cond_dim"):
-            if fe_cond.shape[-1] != cfg.cond_dim-cfg.embed_dim:
+            if fe_cond.shape[-1] != cfg.cond_dim-cfg.guide_dim:
                 raise ValueError(
                     f"cond 维度不匹配: got {fe_cond.shape[-1]}, expected {cfg.cond_dim}"
                 )
@@ -228,6 +232,11 @@ def sample_velocity_trajectory(
     if return_history:
         v_sample_history_norm.append(v_t.squeeze(0).detach().cpu().numpy().copy())
         step_t.append(0.0)
+    if use_cond:
+        cond_pc = torch.from_numpy(cond_pc_np).to(device).float()   # [1, cond_dim]
+        cond_pc = cond_pc.unsqueeze(0)   # [B, P, C]
+        guide_feat, delta_pose_pred = obs_encoder(cond_pc, x_now)   # [B,guide_dim], [B,9]
+        cond = torch.cat([fe_cond, guide_feat], dim=-1)         # [B, cond_dim]
 
     for i in range(steps):
         # flow time，对整条轨迹共用一个标量
@@ -239,10 +248,6 @@ def sample_velocity_trajectory(
         )
 
         if use_cond:
-            cond_pc = torch.from_numpy(cond_pc_np).to(device).float()   # [1, cond_dim]
-            cond_pc = cond_pc.unsqueeze(0)   # [B, P, C]
-            pc_feat = obs_encoder(cond_pc)   # [1, embed_dim]
-            cond = torch.cat([fe_cond, pc_feat], dim=-1)  # [1, cond_dim]
             # Transformer forward 支持 fe: [B, cond_dim]
             # 内部会自动扩成 [B, T, cond_dim]
             u_pred = model(x_t=v_t, t=t_value, fe=cond)   # [1, T, 6]
@@ -561,6 +566,12 @@ def run_direct_field_inference(
                 pad_pc = np.repeat(cond_pc[0:1], pad_len, axis=0)
                 cond_pc = np.concatenate([pad_pc, cond_pc], axis=0)
 
+            cond_pc = np.stack(
+                [uniform_sample_one_frame(pc_t, 2048, use_xyz_only=True) for pc_t in cond_pc],
+                axis=0
+            ).astype(np.float32)
+            cond_pc = (cond_pc / 0.1).astype(np.float32)
+
             cond = np.concatenate([cond_x.reshape(1, -1), cond_fe.reshape(1, -1)], axis=-1)
 
             result = sample_velocity_trajectory(
@@ -685,8 +696,8 @@ if __name__ == "__main__":
     type = "random_start"
 
     run_direct_field_inference(
-        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis_{type}_best.pt",
-        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo/bolt_demo_0000.npz",
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best8.pt",
+        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo/bolt_demo_0001.npz",
         out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_vis_pRFe_{type}",
         max_points=10000,
         steps=10,

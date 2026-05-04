@@ -188,7 +188,7 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "val_loss", "lr", "best_loss"])
+        writer.writerow(["epoch", "train_loss", "val_loss", "lr", "best_loss", "train_fm", "val_fm", "train_dp", "val_dp", "train_dR", "val_dR"])
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -266,6 +266,7 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         train_sum, train_count = 0.0, 0
+        train_fm_sum, train_dp_sum, train_dR_sum = 0.0, 0.0, 0.0
 
         for cond_hist, pc_hist, delta_pose_target, v_future in train_loader:
             cond_hist_flat = cond_hist.to(device).float()           # [B, 6K]
@@ -284,24 +285,38 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
 
             pred = model(xt, t, cond_hist)                # 条件 = 最近 K 步力历史
 
-            loss_fm = F.mse_loss(pred, ut)
-            loss_delta = F.smooth_l1_loss(delta_pose_pred, delta_pose_target)
-            loss = loss_fm + cfg.lambda_delta * loss_delta
+            train_loss_fm = F.mse_loss(pred, ut)
+            # loss_delta = F.smooth_l1_loss(delta_pose_pred, delta_pose_target)
+            loss_dp = F.smooth_l1_loss(delta_pose_pred[:, :3], delta_pose_target[:, :3])
+            loss_dR = F.smooth_l1_loss(delta_pose_pred[:, 3:], delta_pose_target[:, 3:])
+            loss_delta = 2.0 * loss_dp + 1.0 * loss_dR
+
+            loss = train_loss_fm + cfg.lambda_delta * loss_delta
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(obs_encoder.parameters()),
+                max_norm=0.5
+            )
             optimizer.step()
 
             bs = cond_hist.shape[0]
             train_sum += loss.item() * bs
+            train_fm_sum += train_loss_fm.item() * bs
+            train_dp_sum += loss_dp.item() * bs
+            train_dR_sum += loss_dR.item() * bs
             train_count += bs
 
         train_loss = train_sum / max(train_count, 1)
+        train_fm = train_fm_sum / max(train_count, 1)
+        train_dp = train_dp_sum / max(train_count, 1)
+        train_dR = train_dR_sum / max(train_count, 1)
         scheduler.step()
 
         model.eval()
         val_sum, val_count = 0.0, 0
+        val_fm_sum, val_dp_sum, val_dR_sum = 0.0, 0.0, 0.0
         # 让 val 固定，减少波动
         torch.manual_seed(1234)
         torch.cuda.manual_seed_all(1234)
@@ -320,15 +335,24 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
                 cond_hist = torch.cat([cond_hist_flat, guide_feat], dim=-1)         # [B, cond_dim]
                 
                 pred = model(xt, t, cond_hist)
-                loss_fm = F.mse_loss(pred, ut)
-                loss_delta = F.smooth_l1_loss(delta_pose_pred, delta_pose_target)
-                loss = loss_fm + cfg.lambda_delta * loss_delta
+                val_loss_fm = F.mse_loss(pred, ut)
+                # loss_delta = F.smooth_l1_loss(delta_pose_pred, delta_pose_target)
+                loss_dp = F.smooth_l1_loss(delta_pose_pred[:, :3], delta_pose_target[:, :3])
+                loss_dR = F.smooth_l1_loss(delta_pose_pred[:, 3:], delta_pose_target[:, 3:])
+                loss_delta = 2.0 * loss_dp + 1.0 * loss_dR
+                loss = val_loss_fm + cfg.lambda_delta * loss_delta
 
                 bs = cond_hist.shape[0]
                 val_sum += loss.item() * bs
+                val_fm_sum += val_loss_fm.item() * bs
+                val_dp_sum += loss_dp.item() * bs
+                val_dR_sum += loss_dR.item() * bs
                 val_count += bs
 
         val_loss = val_sum / max(val_count, 1)
+        val_fm = val_fm_sum / max(val_count, 1)
+        val_dp = val_dp_sum / max(val_count, 1)
+        val_dR = val_dR_sum / max(val_count, 1)
 
         if val_loss < best_loss:
             best_loss = val_loss
@@ -346,9 +370,19 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
 
         with open(csv_path, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow([epoch, train_loss, val_loss, current_lr, best_loss])
+            writer.writerow([epoch, train_loss, val_loss, current_lr, best_loss, train_fm, val_fm, train_dp, val_dp, train_dR, val_dR])
     
-        print(f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
+        print(
+            f"[Epoch {epoch:03d}] "
+            f"train_loss={train_loss:.6f} "
+            f"val_loss={val_loss:.6f} "
+            f"train_fm_loss={train_fm:.6f} "
+            f"val_fm_loss={val_fm:.6f} "
+            f"train_dp_loss={train_dp:.6f} "
+            f"val_dp_loss={val_dp:.6f} "
+            f"train_dR_loss={train_dR:.6f} "
+            f"val_dR_loss={val_dR:.6f} "
+        )
 
 if __name__ == "__main__":
     # type = "fixed_start"

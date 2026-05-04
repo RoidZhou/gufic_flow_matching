@@ -37,7 +37,7 @@ class TrainConfig:
     embed_dim: int = 64
     input_channels: int = 3
     input_transform: bool = False
-
+    pc_scale: float = 0.5
     # 条件 = 最近 K 步力序列，展平后维度 = 6*K
     x_hist_len: int = 1
     pc_hist_len: int =1
@@ -46,7 +46,7 @@ class TrainConfig:
     # cond_dim: int = 15 * 16        # K=16 步 6 维 力历史，16 步 9 维状态
 
     # 未来预测 horizon
-    pred_horizon: int = 100
+    pred_horizon: int = 20
 
     # 采样步长
     stride: int = 1

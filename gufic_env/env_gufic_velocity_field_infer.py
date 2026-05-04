@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 # sys.path.append(r"/home/zhou/autolab/GUFIC_mujoco-main")
 import open3d as o3d
-from gufic_env.flow_matching.model import VelocityRegressiveMLP, VelocityFMTransformer, VelocityFMMLP, VelocityFMTransformer, VelocityFMCondUnet1D
+from gufic_env.flow_matching.model import VelocityRegressiveMLP, VelocityFMTransformer, VisionDeltaPoseNet, VelocityFMTransformer, VelocityFMCondUnet1D
 from gufic_env.flow_matching.diffusion_model.vision.pointnet import PointNetBackbone
 from gufic_env.flow_matching.dataset import rotmat_batch_to_rot6d
 from tensorboardX import SummaryWriter
@@ -316,7 +316,9 @@ class RobotEnv:
         self.velocity_model.load_state_dict(ckpt["model"])
         self.velocity_model.eval()
 
-        self.obs_encoder = PointNetBackbone(
+        self.obs_encoder = VisionDeltaPoseNet(
+            state_dim=train_cfg["state_dim"],
+            guide_dim=train_cfg["guide_dim"],
             embed_dim=train_cfg["embed_dim"],
             input_channels=train_cfg["input_channels"],
             input_transform=train_cfg["input_transform"],
@@ -454,10 +456,13 @@ class RobotEnv:
                     cond = cond[None, :]
 
                 cond = torch.from_numpy(cond).to(self.fm_device).float()
+                x_now = cond[:, :9]
                 cond_pc = torch.from_numpy(cond_pc).to(self.fm_device).float()
                 cond_pc = cond_pc.unsqueeze(0)   # [B, P, C]
-                pc_feat = self.obs_encoder(cond_pc)   # [1, embed_dim]
-                cond = torch.cat([cond, pc_feat], dim=-1)  # [1, cond_dim]
+                # pc_feat = self.obs_encoder(cond_pc)   # [1, embed_dim]
+                # cond = torch.cat([cond, pc_feat], dim=-1)  # [1, cond_dim]
+                guide_feat, delta_pose_pred = self.obs_encoder(cond_pc, x_now)   # [B,guide_dim], [B,9]
+                cond = torch.cat([cond, guide_feat], dim=-1)         # [B, cond_dim]
 
                 for i in range(self.steps):
                     # flow time，对整条轨迹共用一个标量
@@ -1218,7 +1223,7 @@ if __name__ == "__main__":
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm/fm_best.pt"
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_transformer_fixed_start/fm_best_0.025.pt"
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_transformer_fixed_start/fm_best_4.21.pt"
-    ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis_{type}_best8.pt"
+    ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best8.pt"
 
     assert task in ['regulation', 'circle', 'line', 'sphere']
 
