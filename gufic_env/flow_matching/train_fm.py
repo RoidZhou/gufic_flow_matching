@@ -201,7 +201,9 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         stride=cfg.stride,
         normalize_v=True,
         cond_stats=None,
-        use_pc_color=cfg.use_pc_color
+        use_pc_color=cfg.use_pc_color,
+        robot_model = "indy7",
+        robot_task = "sphere"
     )
     cond_stats = train_dataset.get_cond_stats()
 
@@ -214,7 +216,9 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         stride=cfg.stride,
         normalize_v=True,
         cond_stats=cond_stats,
-        use_pc_color=cfg.use_pc_color
+        use_pc_color=cfg.use_pc_color,
+        robot_model = "indy7",
+        robot_task = "sphere"
     )
 
     train_loader = DataLoader(

@@ -8,6 +8,131 @@ import matplotlib.pyplot as plt
 import glob
 import os
 from tqdm.auto import tqdm  
+import mujoco
+
+def load_xml(robot_name, task):
+    dir = os.getcwd() + '/'
+    if robot_name == 'ur5e':
+        raise NotImplementedError
+    elif robot_name == 'indy7':
+        if task == "sphere":
+            model_path = dir + "gufic_env/mujoco_models/Indy7_wiping_sphere.xml"
+        else:
+            model_path = dir + "gufic_env/mujoco_models/Indy7_wiping.xml"
+    elif robot_name == 'panda':
+        raise NotImplementedError
+    else:
+        raise NotImplementedError
+
+    model = mujoco.MjModel.from_xml_path(model_path)
+    data = mujoco.MjData(model)
+    return model, data
+
+
+def quat_wxyz_to_rotmat(q: np.ndarray) -> np.ndarray:
+    """
+    MuJoCo quaternion format: [w, x, y, z]
+    """
+    q = np.asarray(q, dtype=np.float64).reshape(4)
+    w, x, y, z = q
+    R = np.array([
+        [1 - 2*(y*y + z*z),     2*(x*y - z*w),     2*(x*z + y*w)],
+        [    2*(x*y + z*w), 1 - 2*(x*x + z*z),     2*(y*z - x*w)],
+        [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x*x + y*y)],
+    ], dtype=np.float32)
+    return R
+
+
+def get_hand_eye_from_xml(
+    robot_name: str,
+    task: str,
+    camera_name: str = "eye_in_hand",
+    ee_site_name: str = "end_effector",
+):
+    """
+    读取 XML 后，自动计算固定手眼外参：
+        x_e = R_ec @ x_c + t_ec
+
+    返回:
+        R_ec: [3,3]  camera -> end_effector 的旋转
+        t_ec: [3]    camera 原点在 end_effector 坐标系下的位置
+        extra: dict  调试信息
+    """
+    model, data = load_xml(robot_name, task)
+
+    # 让 data.xpos/xmat/site_xpos/site_xmat 有效
+    mujoco.mj_forward(model, data)
+
+    cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+    site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, ee_site_name)
+
+    if cam_id < 0:
+        raise ValueError(f"Camera '{camera_name}' not found.")
+    if site_id < 0:
+        raise ValueError(f"Site '{ee_site_name}' not found.")
+
+    # 相机的父 body
+    cam_body_id = int(model.cam_bodyid[cam_id])
+
+    # 父 body 在世界系下位姿
+    p_wb = np.array(data.xpos[cam_body_id], dtype=np.float32).copy()
+    R_wb = np.array(data.xmat[cam_body_id], dtype=np.float32).reshape(3, 3).copy()
+
+    # 相机相对父 body 的局部外参
+    p_bc = np.array(model.cam_pos[cam_id], dtype=np.float32).copy()
+    q_bc = np.array(model.cam_quat[cam_id], dtype=np.float32).copy()
+    R_bc = quat_wxyz_to_rotmat(q_bc)
+
+    # 相机在世界系下位姿
+    p_wc = p_wb + R_wb @ p_bc
+    R_wc = R_wb @ R_bc
+
+    # 末端 site 在世界系下位姿
+    p_we = np.array(data.site_xpos[site_id], dtype=np.float32).copy()
+    R_we = np.array(data.site_xmat[site_id], dtype=np.float32).reshape(3, 3).copy()
+
+    # camera -> end_effector
+    # x_e = R_ec @ x_c + t_ec
+    R_ec = R_we.T @ R_wc
+    t_ec = R_we.T @ (p_wc - p_we)
+
+    extra = {
+        "p_wc": p_wc,
+        "R_wc": R_wc,
+        "p_we": p_we,
+        "R_we": R_we,
+        "cam_body_id": cam_body_id,
+        "p_bc": p_bc,
+        "R_bc": R_bc,
+    }
+    return R_ec.astype(np.float32), t_ec.astype(np.float32), extra
+
+def pointcloud_cam_to_world_batch(
+    pc: np.ndarray,   # [T, P, C]
+    p: np.ndarray,    # [T, 3]      end-effector world position
+    R: np.ndarray,    # [T, 3, 3]   end-effector world rotation
+    R_ec: np.ndarray, # [3, 3]      camera -> ee
+    t_ec: np.ndarray, # [3]
+) -> np.ndarray:
+    """
+    利用固定手眼外参，把相机系点云批量变到世界系。
+
+    x_e = R_ec @ x_c + t_ec
+    x_w = R_we @ x_e + p_we
+    """
+    pc = np.asarray(pc, dtype=np.float32)
+    p = np.asarray(p, dtype=np.float32)
+    R = np.asarray(R, dtype=np.float32)
+    R_ec = np.asarray(R_ec, dtype=np.float32).reshape(3, 3)
+    t_ec = np.asarray(t_ec, dtype=np.float32).reshape(3)
+
+    xyz_cam = pc[..., :3]                                      # [T,P,3]
+    xyz_ee = np.einsum("ij,tpj->tpi", R_ec, xyz_cam) + t_ec    # [T,P,3]
+    xyz_w = np.einsum("tij,tpj->tpi", R, xyz_ee) + p[:, None]  # [T,P,3]
+
+    if pc.shape[-1] > 3:
+        return np.concatenate([xyz_w, pc[..., 3:]], axis=-1).astype(np.float32)
+    return xyz_w.astype(np.float32)
 
 def rotmat_batch_to_rot6d(R: np.ndarray) -> np.ndarray:
     """
@@ -153,6 +278,8 @@ class RollingForceHistoryFMDataset(Dataset):
         cond_stats=None,
         use_pc_color=False,
         eps=1e-6,
+        robot_model = None,
+        robot_task = None
     ):
         self.samples = []
         self.force_hist_len = force_hist_len
@@ -197,10 +324,13 @@ class RollingForceHistoryFMDataset(Dataset):
             fe = data["Fe"].astype(np.float32)
             v = data["Vd_star"].astype(np.float32)
             pc = data["point_cloud"].astype(np.float32)
+            R_ec, t_ec, _ = get_hand_eye_from_xml(robot_model, robot_task)
+            pc_world = pointcloud_cam_to_world_batch(pc, p, R, R_ec, t_ec)
+
             if self.use_pc_color:
-                pc = pc
+                pc = pc_world
             else:
-                pc = pc[:,:,:3]
+                pc = pc_world[:,:,:3]
             # 上采样
             pc = np.stack(
                 [uniform_sample_one_frame(pc_t, 2048, use_xyz_only=True) for pc_t in pc],
