@@ -327,10 +327,13 @@ class RollingForceHistoryFMDataset(Dataset):
             R_ec, t_ec, _ = get_hand_eye_from_xml(robot_model, robot_task)
             pc_world = pointcloud_cam_to_world_batch(pc, p, R, R_ec, t_ec)
 
+            pc_ee = np.einsum("tji,tpj->tpi", R, pc_world[..., :3] - p[:, None, :])  # R^T (x_w - p)
+            pc_ee = pc_ee / self.pc_scale
+
             if self.use_pc_color:
-                pc = pc_world
+                pc = pc_ee
             else:
-                pc = pc_world[:,:,:3]
+                pc = pc_ee[:,:,:3]
             # 上采样
             pc = np.stack(
                 [uniform_sample_one_frame(pc_t, 2048, use_xyz_only=True) for pc_t in pc],

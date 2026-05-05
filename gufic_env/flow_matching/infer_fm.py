@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from gufic_env.flow_matching.model import VelocityFMMLP, VelocityFMTransformer, VelocityFMCondUnet1D, VisionDeltaPoseNet
 from gufic_env.flow_matching.config import TrainConfig
-from gufic_env.flow_matching.dataset import rotmat_batch_to_rot6d, uniform_sample_one_frame
+from gufic_env.flow_matching.dataset import rotmat_batch_to_rot6d, uniform_sample_one_frame, get_hand_eye_from_xml, pointcloud_cam_to_world_batch
 from gufic_env.flow_matching.diffusion_model.vision.pointnet import PointNetBackbone
 # ============================================================
 # Config / checkpoint loading
@@ -475,6 +475,8 @@ def run_direct_field_inference(
     max_points=10000,
     steps=100,
     seed=None,
+    robot_model = None,
+    robot_task = None
 ):
     os.makedirs(out_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -527,6 +529,7 @@ def run_direct_field_inference(
         step_t = []
 
         traj_len = cfg.pred_horizon
+        R_ec, t_ec, _ = get_hand_eye_from_xml(robot_model, robot_task)
 
         # 滚动 horizon 模式下 demo 轨迹太长了，直接用 max_points 定死生成长度
         for i in range(len(demo["v"])-1):
@@ -538,11 +541,11 @@ def run_direct_field_inference(
             # 对 fe 做归一化
             cond_fe = normalize_data(cond_fe, stats, "fe").astype(np.float32)
 
-            p = demo["p"][x_left : i + 1].astype(np.float32)       # [T,3]
-            R = demo["R"][x_left : i + 1].astype(np.float32)       # [T,3,3]
-            R6d = rotmat_batch_to_rot6d(R)                        # [T,6]
+            p_raw = demo["p"][x_left : i + 1].astype(np.float32)       # [T,3]
+            R_raw = demo["R"][x_left : i + 1].astype(np.float32)       # [T,3,3]
+            R6d = rotmat_batch_to_rot6d(R_raw)                        # [T,6]
             # 对 p 做归一化
-            p = normalize_data(p, stats, "p").astype(np.float32)
+            p = normalize_data(p_raw, stats, "p").astype(np.float32)
             # 对 R 做归一化
             R6d = normalize_data(R6d, stats, "R").astype(np.float32)
             cond_x = np.concatenate([p, R6d], axis=-1)        # [T,9]
@@ -566,8 +569,11 @@ def run_direct_field_inference(
                 pad_pc = np.repeat(cond_pc[0:1], pad_len, axis=0)
                 cond_pc = np.concatenate([pad_pc, cond_pc], axis=0)
 
+            pc_world = pointcloud_cam_to_world_batch(cond_pc, p_raw, R_raw, R_ec, t_ec)
+            pc_ee = np.einsum("tji,tpj->tpi", R_raw, pc_world[..., :3] - p_raw[:, None, :])  # R^T (x_w - p)
+            pc_ee = pc_ee / 0.1
             cond_pc = np.stack(
-                [uniform_sample_one_frame(pc_t, 2048, use_xyz_only=True) for pc_t in cond_pc],
+                [uniform_sample_one_frame(pc_t, 2048, use_xyz_only=True) for pc_t in pc_ee],
                 axis=0
             ).astype(np.float32)
             cond_pc = (cond_pc / 0.1).astype(np.float32)
@@ -694,12 +700,16 @@ def run_direct_field_inference(
 if __name__ == "__main__":
     # type = "fixed_start"
     type = "random_start"
+    robot_name = 'indy7'
+    robot_task = 'sphere'
 
     run_direct_field_inference(
-        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best8.pt",
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best14.pt",
         demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo/bolt_demo_0001.npz",
         out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_vis_pRFe_{type}",
         max_points=10000,
         steps=10,
         seed=42,
+        robot_model = robot_name,
+        robot_task = robot_task
     )

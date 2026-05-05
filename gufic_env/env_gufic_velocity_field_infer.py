@@ -23,7 +23,7 @@ import torch.nn as nn
 import open3d as o3d
 from gufic_env.flow_matching.model import VelocityRegressiveMLP, VelocityFMTransformer, VisionDeltaPoseNet, VelocityFMTransformer, VelocityFMCondUnet1D
 from gufic_env.flow_matching.diffusion_model.vision.pointnet import PointNetBackbone
-from gufic_env.flow_matching.dataset import rotmat_batch_to_rot6d
+from gufic_env.flow_matching.dataset import rotmat_batch_to_rot6d, pointcloud_cam_to_world_batch, get_hand_eye_from_xml, uniform_sample_one_frame
 from tensorboardX import SummaryWriter
 
 from gufic_env.utils.robot_state import RobotState
@@ -198,6 +198,7 @@ class RobotEnv:
         self.prev_Vd_star_fm = np.zeros((6,), dtype=np.float32)
         self.prev_dVd_star_fm = np.zeros((6,), dtype=np.float32)
         self.record_demos = record_demos
+        self.R_ec, self.t_ec, _ = get_hand_eye_from_xml(self.robot_name, self.task)
 
         self.Fe = np.zeros((6, 1))
         self.reset()
@@ -414,6 +415,8 @@ class RobotEnv:
                             
                 R6d = rotmat_batch_to_rot6d(R)                        # [T,3,3]
 
+                p_raw = p
+                R_raw = R
                 # 对 p 做归一化
                 p = normalize_data(p, self.stats, "p").astype(np.float32)
                 # 对 R 做归一化
@@ -445,6 +448,11 @@ class RobotEnv:
                     pad_len = self.pc_hist_len - cond_pc.shape[0]
                     pad_pc = np.repeat(cond_pc[0:1], pad_len, axis=0)
                     cond_pc = np.concatenate([pad_pc, cond_pc], axis=0)
+
+                pc_world = pointcloud_cam_to_world_batch(cond_pc, p_raw, R_raw, self.R_ec, self.t_ec)
+                pc_ee = np.einsum("tji,tpj->tpi", R_raw, pc_world[..., :3] - p_raw[:, None, :])  # R^T (x_w - p)
+                cond_pc = pc_ee / 0.1
+                cond_pc = (cond_pc / 0.1).astype(np.float32)
 
                 cond = np.concatenate([cond_x.reshape(1, -1), fe_cond.reshape(1, -1)], axis=-1)  # [1, cond_dim]
                 # cond: [K,6] -> [6K]
@@ -999,11 +1007,6 @@ class RobotEnv:
                 point_cloud = point_cloud.astype(np.float32)
             else:
                 point_cloud = point_cloud[:, :3].astype(np.float32)
-
-            pc_raw = point_cloud.astype(np.float32)
-            # pc_center = pc_raw.mean(axis=1, keepdims=True)   # 每帧中心化再缩放
-            # pc_decenter = pc_raw - pc_center
-            point_cloud = (pc_raw / self.pc_scale).astype(np.float32)
             
         else:
             point_cloud = None
@@ -1223,7 +1226,7 @@ if __name__ == "__main__":
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm/fm_best.pt"
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_transformer_fixed_start/fm_best_0.025.pt"
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_transformer_fixed_start/fm_best_4.21.pt"
-    ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best8.pt"
+    ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best14.pt"
 
     assert task in ['regulation', 'circle', 'line', 'sphere']
 
