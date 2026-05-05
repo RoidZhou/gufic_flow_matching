@@ -46,7 +46,7 @@ class TrainConfig:
     # cond_dim: int = 15 * 16        # K=16 步 6 维 力历史，16 步 9 维状态
 
     # 未来预测 horizon
-    pred_horizon: int = 20
+    pred_horizon: int = 100
 
     # 采样步长
     stride: int = 1
