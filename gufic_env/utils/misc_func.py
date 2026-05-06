@@ -1,5 +1,6 @@
 import numpy as np
 import sympy as sp
+from scipy.spatial.transform import Rotation as RT
 
 def vee_map(R):
     v3 = -R[0,1]
@@ -60,7 +61,7 @@ def adjoint_g_ed_deriv(g, gd, v, w, vd, wd):
 
     return mat
 
-def initialize_trajectory(task, max_time = 10):
+def initialize_trajectory(task, max_time = 10, robot_state = None):
     t = sp.symbols('t')
 
     if task == "regulation":
@@ -83,6 +84,11 @@ def initialize_trajectory(task, max_time = 10):
         
     elif task == "sphere":
         pd_default = np.array([0.40, 0.0, 0.0]) #center of the sphere
+        Rd_default = np.array([[0, 1, 0],
+                               [1, 0, 0],
+                               [0, 0, -1]])
+    elif task == "insertion":
+        pd_default = np.array([0.50, 0.0, 0.17])
         Rd_default = np.array([[0, 1, 0],
                                [1, 0, 0],
                                [0, 0, -1]])
@@ -123,6 +129,70 @@ def initialize_trajectory(task, max_time = 10):
         rotmat_y = sp.Matrix([[sp.cos(-theta_y), 0, sp.sin(-theta_y)], [0, 1, 0], [-sp.sin(-theta_y), 0, sp.cos(-theta_y)]])
         Rd_t_sim = Rd_default_sym @ rotmat_y
 
+    elif task == 'insertion':
+        # --- 1) 基准位姿（轴系） ---
+        T1 = 2.0          # 从当前位置到孔口上方
+        T2 = 2.0          # 从孔口上方下落到孔口
+        T3 = max_time - T1 - T2   # 沿孔轴插入
+        h = 0.06         # 孔口上方 4 cm
+
+        # 符号变量
+        t = sp.symbols('t', real=True, nonnegative=True)
+
+        pd_sym = sp.Matrix(pd_default)
+        Rd_sym = sp.Matrix(Rd_default)
+
+        # 世界系下孔轴方向（局部 +Z）
+        z_axis_world = Rd_sym * sp.Matrix([0, 0, 1])
+
+        # 孔口上方预对准位置
+        # p_above = pd_sym + h * z_axis_world
+        # 先验证轨迹逻辑是否正确
+        p_above = pd_sym + sp.Matrix(np.array([0.0, 0.0, h]))
+        def s_curve(tt, T):
+            tau = tt / T
+            return 10*tau**3 - 15*tau**4 + 6*tau**5   # C2 连续
+
+        # ===== 第1段：当前位置 -> 孔口上方 =====
+        s1 = s_curve(t, T1)
+        p0_np, R0_np = robot_state.get_pose()
+        # p0_np, R0_np = pd_default, Rd_default
+        pd_current_sym = sp.Matrix(p0_np)
+        p_seg1 = pd_current_sym + s1 * (p_above - pd_current_sym)
+
+        # ===== 第2段：孔口上方 -> 孔口 =====
+        t2 = t - T1
+        s2 = s_curve(t2, T2)
+        p_seg2 = p_above + s2 * (pd_sym - p_above)
+
+        # ===== 第3段：沿孔轴纯插入 =====
+        t3 = t - (T1 + T2)
+        s3 = s_curve(t3, T3)
+
+        # 插入深度（根据你的孔深和装配需求设置）
+        insert_depth = 0.015   # 例如 3 cm
+
+        # 局部系纯 z 方向推进
+        p_insert_loc = sp.Matrix([0, 0, insert_depth * s3])
+        p_insert = pd_sym + Rd_sym * p_insert_loc
+
+        # 姿态保持不变
+        R_insert = Rd_sym
+
+        # ===== 拼接三段 =====
+        pd_default_sym = sp.Piecewise(
+            (p_seg1, t <= T1),
+            (p_seg2, (t > T1) & (t <= T1 + T2)),
+            (p_insert, t > T1 + T2)
+        )
+
+        Rd_default_sym = sp.Piecewise(
+            (Rd_sym, t <= T1 + T2),
+            (R_insert, t > T1 + T2)
+        )
+
+        pd_t_sim = pd_default_sym
+        Rd_t_sim = Rd_default_sym
 
     # Differentiate with symbolic expressions
     dpd_t_sim = sp.diff(pd_t_sim, t)
@@ -142,7 +212,7 @@ def initialize_trajectory(task, max_time = 10):
 
 def set_gains(controller = "GUFIC", task = "regulation"):
     assert controller in ["GUFIC", "GIC"], "Invalid controller"
-    assert task in ["regulation", "circle", "line", "sphere"], "Invalid task"
+    assert task in ["regulation", "circle", "line", "sphere", "insertion"], "Invalid task"
     
     if controller == "GIC":
         if task == "regulation":
@@ -158,7 +228,7 @@ def set_gains(controller = "GUFIC", task = "regulation"):
         return Kp, KR, Kd
 
     elif controller == "GUFIC":
-        if task == "regulation":
+        if task in ["regulation", "insertion"]:
             Kp = np.eye(3) * np.array([1500, 1500, 10])
             KR = np.eye(3) * np.array([1500, 1500, 1500])
             Kd = np.eye(6) * np.array([500, 500, 500, 500, 500, 500])

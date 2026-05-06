@@ -36,7 +36,7 @@ class RobotEnv:
             self.observables = observables
         else:
             self.observables = ['p', 'pd', 'R', 'Rd', 'x_tf', 'x_ti', 'Fe', 'Fe_raw', 'Fd', 'rho']
-        self.demo_recorder = BoltTrajectoryRecorder(save_dir="./bolt_demos_vis_random_start")
+        self.demo_recorder = BoltTrajectoryRecorder(save_dir="/media/zhou/Elements SE/VLA/peg_demos_vis_random_start")
         self.fz = fz
         self.fix_camera = fix_camera
         self.fz_mode = "other"
@@ -48,7 +48,7 @@ class RobotEnv:
         # ==============================
         # Point cloud camera settings
         # ==============================
-        self.vis_point = True
+        self.vis_point = False
         self.camera_name = "eye_in_hand"   # 你 XML 里末端相机的名字
         self.cam_id = -1
 
@@ -78,15 +78,21 @@ class RobotEnv:
         
         self.z_init_offset = -0.1
 
-        self.pd_t, self.Rd_t, self.dpd_t, self.dRd_t, self.ddpd_t, self.ddRd_t = initialize_trajectory(task = self.task)
-
         self.show_viewer = show_viewer
         self.load_xml()
 
         self.robot_state = RobotState(self.model, self.data, "end_effector", self.robot_name)
 
+        if self.task == 'insertion':
+            self.p_init = np.array([0.50, 0.0, 0.225])
+            self.R_init = np.array([[0, 1, 0],
+                               [1, 0, 0],
+                               [0, 0, -1]])
+            self.set_robot_to_pose(self.p_init, self.R_init)
+
         self.dt = self.model.opt.timestep
         self.max_iter = int(max_time/self.dt)
+        self.max_time = max_time
 
         self.iter = 0
 
@@ -107,6 +113,8 @@ class RobotEnv:
         elif self.robot_name == 'indy7':
             if self.task == "sphere":
                 model_path = dir + "gufic_env/mujoco_models/Indy7_wiping_sphere.xml"
+            elif self.task == "insertion":
+                model_path = dir + "gufic_env/mujoco_models/Indy7_insertion.xml"
             else:
                 model_path = dir + "gufic_env/mujoco_models/Indy7_wiping.xml"
 
@@ -279,51 +287,110 @@ class RobotEnv:
             height=720
         )
     
-    def reset(self, angle_prefix = None):
-        self.iter = 0 
+    def set_robot_to_pose(self, p_des, R_des):
+        """
+        通过 IK 将机器人直接设置到指定末端位姿。
+        p_des: shape (3,)
+        R_des: shape (3, 3)
+        """
+        p_des = np.asarray(p_des, dtype=np.float64).reshape(3)
+        R_des = np.asarray(R_des, dtype=np.float64).reshape(3, 3)
 
-        pd = self.pd_t(0)
-        Rd = self.Rd_t(0)
+        if self.model.nv == 6:
+            q0 = np.array([0, 0, -np.pi / 2, 0, -np.pi / 2, np.pi / 2])
+        elif self.model.nv == 8:
+            q0 = np.array([0, 0, -np.pi / 2, 0, -np.pi / 2, np.pi / 2, 0, 0])
+        elif self.model.nv == 10:
+            q0 = np.array([0, 0, -np.pi / 2, 0, -np.pi / 2, np.pi / 2, 0, 0, 0, 0])
+        else:
+            q0 = np.zeros(self.model.nv)
+
+        self.robot_state.gauss_newton_IK(p_des, R_des, q0)
+
+        mujoco.mj_forward(self.model, self.data)
+        self.robot_state.update()
+
+        if self.show_viewer and self.viewer is not None:
+            self.viewer.sync()
+
+    def reset(self, angle_prefix=None):
+        self.iter = 0
+
+        if self.task == "insertion":
+            pd = self.p_init
+            Rd = self.R_init
+        else:
+            # 先生成轨迹，保证非 insertion 任务能取 pd_t(0), Rd_t(0)
+            self.pd_t, self.Rd_t, self.dpd_t, self.dRd_t, self.ddpd_t, self.ddRd_t = initialize_trajectory(
+                task=self.task,
+                max_time=self.max_time,
+                robot_state=self.robot_state
+            )
+            pd = self.pd_t(0)
+            Rd = self.Rd_t(0)
 
         if self.randomized_start:
-            rand_xy = 2*(np.random.rand(2,) - 0.5) * 0.05
-            rand_rpy = 2*(np.random.rand(3,) - 0.5) * 15 /180 * np.pi
+            rand_xy = 2 * (np.random.rand(2,) - 0.5) * 0.05
+            rand_rpy = 2 * (np.random.rand(3,) - 0.5) * 15 / 180 * np.pi
         else:
-
             rand_xy = np.array([0.05, -0.05])
-            rand_rpy = np.array([15, -15, 15]) * np.pi /180
+            rand_rpy = np.array([15, -15, 15]) * np.pi / 180
 
-        Rx = np.array([[1, 0, 0], [0, np.cos(rand_rpy[0]), -np.sin(rand_rpy[0])], [0, np.sin(rand_rpy[0]), np.cos(rand_rpy[0])]])
-        Ry = np.array([[np.cos(rand_rpy[1]), 0, np.sin(rand_rpy[1])], [0, 1, 0], [-np.sin(rand_rpy[1]), 0, np.cos(rand_rpy[1])]])
-        Rz = np.array([[np.cos(rand_rpy[2]), -np.sin(rand_rpy[2]), 0], [np.sin(rand_rpy[2]), np.cos(rand_rpy[2]), 0], [0, 0, 1]])
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(rand_rpy[0]), -np.sin(rand_rpy[0])],
+            [0, np.sin(rand_rpy[0]),  np.cos(rand_rpy[0])]
+        ])
+        Ry = np.array([
+            [ np.cos(rand_rpy[1]), 0, np.sin(rand_rpy[1])],
+            [0, 1, 0],
+            [-np.sin(rand_rpy[1]), 0, np.cos(rand_rpy[1])]
+        ])
+        Rz = np.array([
+            [np.cos(rand_rpy[2]), -np.sin(rand_rpy[2]), 0],
+            [np.sin(rand_rpy[2]),  np.cos(rand_rpy[2]), 0],
+            [0, 0, 1]
+        ])
 
-        p_init = pd.reshape((-1,1)) + Rd @ np.array([rand_xy[0], rand_xy[1], self.z_init_offset]).reshape(-1,1)
+        p_init = pd.reshape((-1, 1)) + Rd @ np.array(
+            [rand_xy[0], rand_xy[1], self.z_init_offset]
+        ).reshape(-1, 1)
+
         R_init = Rd @ Rz @ Ry @ Rx
-
         p_init = p_init.reshape((-1,))
 
         if self.model.nv == 8:
             q0 = np.array([0, 0, -np.pi/2, 0, -np.pi/2, np.pi/2, 0, 0])
         elif self.model.nv == 6:
             q0 = np.array([0, 0, -np.pi/2, 0, -np.pi/2, np.pi/2])
+        elif self.model.nv == 10:
+            q0 = np.array([0, 0, -np.pi/2, 0, -np.pi/2, np.pi/2, 0, 0, 0, 0])
+        else:
+            q0 = np.zeros(self.model.nv)
 
         self.robot_state.gauss_newton_IK(p_init, R_init, q0)
 
-        self.Fe = np.zeros((6,1))
-
-        obs = np.zeros((6,1))
+        self.Fe = np.zeros((6, 1))
+        obs = np.zeros((6, 1))
 
         Rt = np.eye(3)
         self.set_hole_pose(self.p_plate, Rt)
 
         self.robot_state.update()
 
+        # insertion 会从当前真实初始位姿开始
+        if self.task == "insertion":
+            self.pd_t, self.Rd_t, self.dpd_t, self.dRd_t, self.ddpd_t, self.ddRd_t = initialize_trajectory(
+                task=self.task,
+                max_time=self.max_time,
+                robot_state=self.robot_state
+            )
+
         p, R = self.robot_state.get_pose()
 
-        # Reset integration variable gd
         self.gd = np.eye(4)
-        self.gd[:3,3] = p
-        self.gd[:3,:3] = R
+        self.gd[:3, 3] = p
+        self.gd[:3, :3] = R
 
         if self.show_viewer:
             self.viewer.sync()
@@ -528,7 +595,7 @@ class RobotEnv:
         self.robot_state.update()
 
         tau_cmd = self.geometric_unified_force_impedance_control()
-        V = self.torque_to_velocity(tau_cmd, self.dt)
+        # V = self.torque_to_velocity(tau_cmd, self.dt)
         gripper = 0.03
 
         self.robot_state.set_control_torque(tau_cmd, gripper) # 机器人力矩控制
@@ -671,7 +738,7 @@ class RobotEnv:
         Fe, d_Fe = self.get_FT_value(return_derivative=True)
         # print("Fe : ", Fe)
         # print("d_Fe : ", d_Fe)
-        # print("Fe : ", Fe)
+        print("Fe : ", Fe)
         Fe = Fe.reshape((-1,1))
         d_Fe = d_Fe.reshape((-1,1))
         # force_x = Fe[0]
@@ -908,9 +975,9 @@ if __name__ == "__main__":
     inertia_shaping = False
     episode_number = 50
     
-    task = 'sphere'  # "regulation", 'circle', 'line'
+    task = 'insertion'  # "regulation", 'circle', 'line'
 
-    assert task in ['regulation', 'circle', 'line', 'sphere']
+    assert task in ['regulation', 'circle', 'line', 'sphere', 'insertion']
 
     if task == 'regulation':
         max_time = 6
@@ -920,11 +987,15 @@ if __name__ == "__main__":
         max_time = 10
     elif task == 'sphere':
         max_time = 10
+        fz = 10
+    else:
+        max_time = 6
+        fz = 5
 
-    RE = RobotEnv(robot_name, show_viewer = show_viewer, max_time = max_time, fz = 10, 
+    RE = RobotEnv(robot_name, show_viewer = show_viewer, max_time = max_time, fz = fz, 
                   fix_camera = True, task = task, randomized_start=randomized_start, inertia_shaping = inertia_shaping)
     
-    for episode in range(98, 200):
+    for episode in range(0, 100):
         RE.reset()
         RE.run()
         RE.demo_recorder.save(f"bolt_demo_{episode:04d}")

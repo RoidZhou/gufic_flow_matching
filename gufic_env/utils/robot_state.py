@@ -230,8 +230,8 @@ class RobotState:
             step_cnt += 1
 
         if self.model.nv == 8:
-            self.data.qpos[-1] = 0
-            self.data.qpos[-2] = 0
+            self.data.qpos[-1] = 0.03
+            self.data.qpos[-2] = -0.03
         elif self.model.nv == 6:
             pass
         mujoco.mj_forward(self.model, self.data)
@@ -310,19 +310,25 @@ class RobotState:
     def get_sim_time(self):
         return self.data.time
 
-    def set_control_torque(self, tau, gripper = 0):
+    def set_control_torque(self, tau, gripper=0):
         """Set control torque to robot actuators."""
+        tau = np.asarray(tau).reshape(-1)
         assert tau.shape[0] == self.N
-        # self.data.ctrl[:] = np.hstack((tau, [0, 0]))
-        # if self.robot_name == 'ur5e':
-        #     self.data.ctrl[:] = tau
-        # else:
-        #     self.data.ctrl[:] = np.hstack((tau, [0, 0]))
 
         if self.robot_name == 'indy7':
-            if self.model.nv == 8:
-                self.data.ctrl[:] = np.hstack((tau, [-gripper, gripper]))
-            elif self.model.nv == 6:
-                self.data.ctrl[:] = tau
+            if self.model.nu == 8:
+                # 6 个机械臂 torque actuator + 2 个夹爪 position actuator
+                self.data.ctrl[:6] = tau
+                self.data.ctrl[6] = -gripper
+                self.data.ctrl[7] = gripper
+
+            elif self.model.nu == 6:
+                # 只有 6 个机械臂 actuator
+                self.data.ctrl[:6] = tau
+
+            else:
+                raise ValueError(
+                    f"Unexpected actuator number: model.nu={self.model.nu}, model.nv={self.model.nv}"
+                )
         else:
             self.data.ctrl[:] = tau

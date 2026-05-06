@@ -220,7 +220,7 @@ def sample_velocity_trajectory(
 
         # 可选检查
         if hasattr(cfg, "cond_dim"):
-            if fe_cond.shape[-1] != cfg.cond_dim-cfg.guide_dim:
+            if fe_cond.shape[-1] != cfg.cond_dim:
                 raise ValueError(
                     f"cond 维度不匹配: got {fe_cond.shape[-1]}, expected {cfg.cond_dim}"
                 )
@@ -236,7 +236,7 @@ def sample_velocity_trajectory(
         cond_pc = torch.from_numpy(cond_pc_np).to(device).float()   # [1, cond_dim]
         cond_pc = cond_pc.unsqueeze(0)   # [B, P, C]
         guide_feat, delta_pose_pred = obs_encoder(cond_pc, x_now)   # [B,guide_dim], [B,9]
-        cond = torch.cat([fe_cond, guide_feat], dim=-1)         # [B, cond_dim]
+        # cond = torch.cat([fe_cond, guide_feat], dim=-1)         # [B, cond_dim]
 
     for i in range(steps):
         # flow time，对整条轨迹共用一个标量
@@ -250,7 +250,13 @@ def sample_velocity_trajectory(
         if use_cond:
             # Transformer forward 支持 fe: [B, cond_dim]
             # 内部会自动扩成 [B, T, cond_dim]
-            u_pred = model(x_t=v_t, t=t_value, fe=cond)   # [1, T, 6]
+            # u_pred = model(x_t=v_t, t=t_value, fe=cond)   # [1, T, 6]
+            u_pred = model(
+                x_t=v_t,
+                t=t_value,
+                cond_main=fe_cond,
+                guide=guide_feat,
+            )
         else:
             u_pred = model(x_t=v_t, t=t_value)               # [1, T, 6]
 
@@ -704,8 +710,8 @@ if __name__ == "__main__":
     robot_task = 'sphere'
 
     run_direct_field_inference(
-        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best14.pt",
-        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo/bolt_demo_0001.npz",
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best19.pt",
+        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo/bolt_demo_0098.npz",
         out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_vis_pRFe_{type}",
         max_points=10000,
         steps=10,

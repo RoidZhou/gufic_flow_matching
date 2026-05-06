@@ -470,7 +470,7 @@ class RobotEnv:
                 # pc_feat = self.obs_encoder(cond_pc)   # [1, embed_dim]
                 # cond = torch.cat([cond, pc_feat], dim=-1)  # [1, cond_dim]
                 guide_feat, delta_pose_pred = self.obs_encoder(cond_pc, x_now)   # [B,guide_dim], [B,9]
-                cond = torch.cat([cond, guide_feat], dim=-1)         # [B, cond_dim]
+                # cond = torch.cat([cond, guide_feat], dim=-1)         # [B, cond_dim]
 
                 for i in range(self.steps):
                     # flow time，对整条轨迹共用一个标量
@@ -482,8 +482,13 @@ class RobotEnv:
                     )
 
                     # 内部会自动扩成 [B, T, cond_dim]
-                    u_pred = self.velocity_model(x_t=v_t, t=t_value, fe=cond)   # [1, T, 6]
-
+                    # u_pred = self.velocity_model(x_t=v_t, t=t_value, fe=cond)   # [1, T, 6]
+                    u_pred = self.velocity_model(
+                        x_t=v_t,
+                        t=t_value,
+                        cond_main=cond,
+                        guide=guide_feat,
+                    )
                     # Euler 更新
                     v_t = v_t + u_pred * dt
             
@@ -1226,7 +1231,7 @@ if __name__ == "__main__":
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm/fm_best.pt"
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_transformer_fixed_start/fm_best_0.025.pt"
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_transformer_fixed_start/fm_best_4.21.pt"
-    ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best14.pt"
+    ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best19.pt"
 
     assert task in ['regulation', 'circle', 'line', 'sphere']
 

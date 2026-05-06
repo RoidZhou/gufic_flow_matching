@@ -128,14 +128,11 @@ class VelocityFMMLP(nn.Module):
 #   v:   [B, T, x_dim]
 # ============================================================
 class VelocityFMTransformer(nn.Module):
-    """
-    为了最小改动，类名仍然保留 BoltVelocityMLP
-    但内部已经改成 Transformer Encoder 版本
-    """
     def __init__(
         self,
         x_dim=6,
-        cond_dim=6,
+        cond_dim=6,          # 这里只放 cond_main 维度，不再包含 guide_dim
+        guide_dim=16,        # 新增
         time_dim=64,
         hidden_dim=256,
         num_layers=4,
@@ -150,25 +147,36 @@ class VelocityFMTransformer(nn.Module):
         self.hidden_dim = hidden_dim
         self.max_seq_len = max_seq_len
 
-        if self.use_cond:
-            in_dim = x_dim + cond_dim + time_dim
-        else:
-            in_dim = x_dim + time_dim
+        # x_t + t_emb 先单独投影
+        self.input_proj = nn.Linear(x_dim + time_dim, hidden_dim)
 
-        # 输入投影
-        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        # 主条件分支：p/R/Fe 历史
+        if self.use_cond:
+            self.cond_proj = nn.Sequential(
+                nn.Linear(cond_dim, hidden_dim),
+                nn.Mish(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        else:
+            self.cond_proj = None
+
+        # guide_feat 单独控制 hidden
+        self.guide_scale = nn.Sequential(
+            nn.Linear(guide_dim, hidden_dim),
+            nn.Tanh(),   # 控制 scale 幅度
+        )
+        self.guide_shift = nn.Linear(guide_dim, hidden_dim)
 
         # 可学习位置编码
         self.pos_embed = nn.Parameter(torch.randn(1, max_seq_len, hidden_dim) * 0.02)
 
-        # Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=nhead,
             dim_feedforward=hidden_dim * 4,
             dropout=dropout,
             activation="gelu",
-            batch_first=True,   # 输入输出都是 [B, T, C]
+            batch_first=True,
             norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(
@@ -176,78 +184,63 @@ class VelocityFMTransformer(nn.Module):
             num_layers=num_layers,
         )
 
-        # 输出投影回速度维度
         self.output_proj = nn.Linear(hidden_dim, x_dim)
 
-    def forward(self, x_t, t, fe=None):
+    def forward(self, x_t, t, cond_main=None, guide=None):
         """
-        x_t:
-          [B, T, x_dim]
-          也兼容 [B, x_dim]，会自动扩成 T=1
-
-        t:
-          [B, 1]      -> 自动 broadcast 到 [B, T, 1]
-          或 [B, T, 1]
-
-        fe:
-          None
-          或 [B, cond_dim]
-          或 [B, T, cond_dim]
+        x_t: [B,T,6] or [B,6]
+        t:   [B,1] or [B,T,1]
+        cond_main: [B,cond_dim] or [B,T,cond_dim]
+        guide:     [B,guide_dim] or [B,T,guide_dim]
         """
         squeeze_back = False
 
-        # 兼容单步输入 [B, x_dim]
         if x_t.dim() == 2:
-            x_t = x_t.unsqueeze(1)   # [B, 1, x_dim]
+            x_t = x_t.unsqueeze(1)
             squeeze_back = True
 
         B, T, _ = x_t.shape
-
         if T > self.max_seq_len:
             raise ValueError(f"Sequence length {T} exceeds max_seq_len={self.max_seq_len}")
 
-        # 处理 t
+        # t -> [B,T,1]
         if t.dim() == 2:
-            # [B,1] -> [B,T,1]
-            t = t.unsqueeze(1) if t.shape[-1] != 1 else t[:, None, :]
+            t = t[:, None, :]
             t = t.expand(B, T, 1)
-        elif t.dim() == 3:
-            if t.shape[1] == 1:
-                t = t.expand(B, T, 1)
-        else:
-            raise ValueError(f"Unexpected t shape: {t.shape}")
+        elif t.dim() == 3 and t.shape[1] == 1:
+            t = t.expand(B, T, 1)
 
-        t_emb = self.time_emb(t)   # [B, T, time_dim]
+        t_emb = self.time_emb(t)                       # [B,T,time_dim]
+        h = self.input_proj(torch.cat([x_t, t_emb], dim=-1))   # [B,T,H]
 
-        # 处理条件 fe
+        # 主条件注入
         if self.use_cond:
-            if fe is None:
-                raise ValueError("use_cond=True 时，fe 不能为 None")
+            if cond_main is None:
+                raise ValueError("use_cond=True 时，cond_main 不能为 None")
+            if cond_main.dim() == 2:
+                cond_main = cond_main.unsqueeze(1).expand(B, T, cond_main.shape[-1])
+            elif cond_main.dim() == 3 and cond_main.shape[1] == 1:
+                cond_main = cond_main.expand(B, T, cond_main.shape[-1])
 
-            if fe.dim() == 2:
-                fe = fe.unsqueeze(1).expand(B, T, fe.shape[-1])   # [B, T, cond_dim]
-            elif fe.dim() == 3:
-                if fe.shape[1] == 1:
-                    fe = fe.expand(B, T, fe.shape[-1])
-            else:
-                raise ValueError(f"Unexpected fe shape: {fe.shape}")
+            h = h + self.cond_proj(cond_main)
 
-            h = torch.cat([x_t, fe, t_emb], dim=-1)   # [B, T, in_dim]
-        else:
-            h = torch.cat([x_t, t_emb], dim=-1)
+        # guide_feat 直接做 FiLM
+        if guide is not None:
+            if guide.dim() == 2:
+                guide = guide.unsqueeze(1).expand(B, T, guide.shape[-1])
+            elif guide.dim() == 3 and guide.shape[1] == 1:
+                guide = guide.expand(B, T, guide.shape[-1])
 
-        # 输入投影 + 位置编码
-        h = self.input_proj(h)                        # [B, T, hidden_dim]
-        h = h + self.pos_embed[:, :T, :]             # [B, T, hidden_dim]
+            scale = self.guide_scale(guide)   # [B,T,H]
+            shift = self.guide_shift(guide)   # [B,T,H]
+            h = h * (1.0 + scale) + shift
 
-        # Transformer
-        h = self.transformer(h)                       # [B, T, hidden_dim]
-
-        # 输出速度场
-        out = self.output_proj(h)                     # [B, T, x_dim]
+        h = h + self.pos_embed[:, :T, :]
+        h = self.transformer(h)
+        out = self.output_proj(h)
 
         if squeeze_back:
-            out = out.squeeze(1)                      # 回到 [B, x_dim]
+            out = out.squeeze(1)
 
         return out
 
