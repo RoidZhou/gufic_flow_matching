@@ -1,14 +1,11 @@
+import mujoco
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import math
 import matplotlib.pyplot as plt
 import glob
 import os
 from tqdm.auto import tqdm  
-import mujoco
 
 def load_xml(robot_name, task):
     dir = os.getcwd() + '/'
@@ -537,13 +534,13 @@ class RollingForceHistoryFMDataset(Dataset):
         fe_hist_flat = fe_hist.reshape(-1)        # [6K]
         x_hist_flat = np.concatenate([p_hist_flat, R_hist_flat], axis=-1)   # [12K]
 
-        # p_now = s["p_now"]
-        # R6d_now = s["R6d_now"]
-        # x_now = np.concatenate([p_now, R6d_now], axis=-1)
+        p_now = s["p_hist"][-1]      # [3]
+        R_now = s["R_hist"][-1]      # [6]
+        x_now = np.concatenate([p_now, R_now], axis=-1).astype(np.float32)
         cond_hist = np.concatenate([x_hist_flat, fe_hist_flat], axis=-1)   # [12K]
         return (
             torch.from_numpy(cond_hist.astype(np.float32)),   # [6K]
-            # torch.from_numpy(x_now.astype(np.float32)),   # [6K]
+            torch.from_numpy(x_now.astype(np.float32)),   # [6K]
             torch.from_numpy(s["pc_hist"].astype(np.float32)),  # [H,6]
             torch.from_numpy(s["delta_pose_target_norm"].astype(np.float32)),
             torch.from_numpy(s["v_future"].astype(np.float32)),  # [H,6]

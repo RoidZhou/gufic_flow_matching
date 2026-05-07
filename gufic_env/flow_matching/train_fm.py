@@ -1,3 +1,5 @@
+import mujoco
+import mujoco.viewer
 import os
 import matplotlib.pyplot as plt
 import torch
@@ -366,13 +368,12 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         train_sum, train_count = 0.0, 0
         train_fm_sum, train_dp_sum, train_dR_sum = 0.0, 0.0, 0.0
 
-        for cond_hist, pc_hist, delta_pose_target, v_future in train_loader:
+        for cond_hist, x_now, pc_hist, delta_pose_target, v_future in train_loader:
             cond_hist_flat = cond_hist.to(device).float()
             pc_hist = pc_hist.to(device).float()
             delta_pose_target = delta_pose_target.to(device).float()
             v_future = v_future.to(device).float()
-
-            x_now = cond_hist_flat[:, :9]
+            x_now = x_now.to(device).float()
 
             _, x1, t, xt, ut = path_sampler.sample_training_tuple(v_future)
             guide_feat, delta_pose_pred = obs_encoder(pc_hist, x_now)
@@ -424,13 +425,12 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         torch.cuda.manual_seed_all(1234)
 
         with torch.no_grad():
-            for cond_hist_flat, pc_hist, delta_pose_target, v_future in val_loader:
+            for cond_hist_flat, x_now, pc_hist, delta_pose_target, v_future in val_loader:
                 cond_hist_flat = cond_hist_flat.to(device).float()
                 pc_hist = pc_hist.to(device).float()
                 delta_pose_target = delta_pose_target.to(device).float()
                 v_future = v_future.to(device).float()
-
-                x_now = cond_hist_flat[:, :9]
+                x_now = x_now.to(device).float()
 
                 _, x1, t, xt, ut = path_sampler.sample_training_tuple(v_future)
                 guide_feat, delta_pose_pred = obs_encoder(pc_hist, x_now)
