@@ -527,12 +527,11 @@ class RollingForceHistoryFMDataset(Dataset):
     def __getitem__(self, idx):
         s = self.samples[idx]
         p_hist = s["p_hist"]
-        p_hist_flat = p_hist.reshape(-1)        # [6K]
         R_hist = s["R_hist"]
-        R_hist_flat = R_hist.reshape(-1)        # [6K]
         fe_hist = s["fe_hist"]                    # [K,6]
         fe_hist_flat = fe_hist.reshape(-1)        # [6K]
-        x_hist_flat = np.concatenate([p_hist_flat, R_hist_flat], axis=-1)   # [12K]
+        x_hist = np.concatenate([p_hist, R_hist], axis=-1)   # [K, 9]
+        x_hist_flat = x_hist.reshape(-1)                     # [9K]
 
         p_now = s["p_hist"][-1]      # [3]
         R_now = s["R_hist"][-1]      # [6]
