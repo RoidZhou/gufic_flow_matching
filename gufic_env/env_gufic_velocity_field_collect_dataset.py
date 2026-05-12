@@ -24,8 +24,8 @@ from recorder import BoltTrajectoryRecorder
 
 class RobotEnv:
     def __init__(self, robot_name = 'indy7', max_time = 20, show_viewer = False, fz = 5, observables = None,
-                 fix_camera = False, task = 'regulation', randomized_start = False, inertia_shaping = False
-                 ):
+                 fix_camera = False, task = 'regulation', randomized_start = False, inertia_shaping = False,
+                 save_dir = None):
         
         self.robot_name = robot_name
         self.task = task
@@ -36,11 +36,12 @@ class RobotEnv:
             self.observables = observables
         else:
             self.observables = ['p', 'pd', 'R', 'Rd', 'x_tf', 'x_ti', 'Fe', 'Fe_raw', 'Fd', 'rho']
-        self.demo_recorder = BoltTrajectoryRecorder(save_dir="/media/zhou/Elements SE/VLA/peg_demos_vis_random_start")
+        self.demo_recorder = BoltTrajectoryRecorder(save_dir=save_dir)
         self.fz = fz
         self.fix_camera = fix_camera
         self.fz_mode = "other"
         self.golbal_steps = 0
+        self.start_from_random = False
         self.writer = SummaryWriter('./gufic/logs')
         self.writer1 = SummaryWriter('./gufic/logs1')
         self.writer2 = SummaryWriter('./gufic/logs2')
@@ -88,6 +89,16 @@ class RobotEnv:
             self.R_init = np.array([[0, 1, 0],
                                [1, 0, 0],
                                [0, 0, -1]])
+
+            self.set_robot_to_pose(self.p_init, self.R_init)
+        elif self.task == 'bolt':
+            # self.p_init = np.array([0.50, 0.0, 0.225])
+            self.p_init = np.array([0.50, 0.0, 0.29])
+            Rd_default = np.array([[0, 1, 0],
+                               [1, 0, 0],
+                               [0, 0, -1]])
+            U, _, Vt = np.linalg.svd(Rd_default)
+            self.R_init = U @ Vt
             self.set_robot_to_pose(self.p_init, self.R_init)
 
         self.dt = self.model.opt.timestep
@@ -99,7 +110,7 @@ class RobotEnv:
         self.Fe = np.zeros((6,1))
         self.reset()
 
-        self.Kp, self.KR, self.Kd, self.kp_force, self.kd_force, self.ki_force, self.zeta = set_gains(controller = 'GUFIC', task = self.task)
+        self.Kp, self.KR, self.Kd, self.kp_force, self.kd_force, self.ki_force, self.zeta_v, self.zeta_w = set_gains(controller = 'GUFIC', task = self.task)
 
         # print("Gains:", self.Kp, self.KR, self.Kd, self.kp_force, self.kd_force, self.ki_force, self.zeta)
         # print(self.pd_t(0))
@@ -115,6 +126,8 @@ class RobotEnv:
                 model_path = dir + "gufic_env/mujoco_models/Indy7_wiping_sphere.xml"
             elif self.task == "insertion":
                 model_path = dir + "gufic_env/mujoco_models/Indy7_insertion.xml"
+            elif self.task == "bolt":
+                model_path = dir + "gufic_env/mujoco_models/Indy7_nutbolt.xml"
             else:
                 model_path = dir + "gufic_env/mujoco_models/Indy7_wiping.xml"
 
@@ -124,6 +137,9 @@ class RobotEnv:
         else:
             raise NotImplementedError
 
+        # mujoco.mj_loadPluginLibrary(
+        #     "/home/zhou/vla/mujoco_custom/mujoco/build/lib/libsdf_plugin.so"
+        # )
         self.model = mujoco.MjModel.from_xml_path(model_path)
         # self.sim = mujoco.MjSim(self.model)
 
@@ -316,7 +332,7 @@ class RobotEnv:
     def reset(self, angle_prefix=None):
         self.iter = 0
 
-        if self.task == "insertion":
+        if self.start_from_random and self.task in ["insertion", "bolt"]:
             pd = self.p_init
             Rd = self.R_init
         else:
@@ -379,7 +395,7 @@ class RobotEnv:
         self.robot_state.update()
 
         # insertion 会从当前真实初始位姿开始
-        if self.task == "insertion":
+        if self.start_from_random and self.task in ["insertion", "bolt"]:
             self.pd_t, self.Rd_t, self.dpd_t, self.dRd_t, self.ddpd_t, self.ddRd_t = initialize_trajectory(
                 task=self.task,
                 max_time=self.max_time,
@@ -400,6 +416,7 @@ class RobotEnv:
         ## For the force tracking
         self.e_force_prev = np.zeros((6,1))
         self.int_force_prev = np.zeros((6,1))
+        self.force_bias = self.get_FT_value().reshape(6,1)
 
         ## For the energy tank
         self.T_f_low = 0.5
@@ -532,7 +549,8 @@ class RobotEnv:
         return pd.reshape((-1,)), Rd, vd.reshape((-1,)), wd.reshape((-1,)), dvd.reshape((-1,)), dwd.reshape((-1,))
     
     def get_velocity_field(self, g, V, t):
-        zeta = self.zeta
+        zeta_v = self.zeta_v  # 速度场参数
+        zeta_w = self.zeta_w  # 速度场参数
         pd = self.pd_t(t).reshape((-1,))
         Rd = self.Rd_t(t)
 
@@ -549,8 +567,8 @@ class RobotEnv:
         w = V[3:]
 
         Vd_star = np.zeros(6,)
-        vd_star = R.T @ dRd @ Rd.T @ (p - pd) + R.T @ dpd - zeta * R.T @ (p - pd)
-        wd_star = vee_map(R.T @ dRd @ Rd.T @ R - zeta * (Rd.T @ R - R.T @ Rd)).reshape((-1,))
+        vd_star = R.T @ dRd @ Rd.T @ (p - pd) + R.T @ dpd - zeta_v * R.T @ (p - pd)
+        wd_star = vee_map(R.T @ dRd @ Rd.T @ R - zeta_w * (Rd.T @ R - R.T @ Rd)).reshape((-1,))
 
         Vd_star[:3] = vd_star
         Vd_star[3:] = wd_star
@@ -561,41 +579,19 @@ class RobotEnv:
                 + R.T @ dRd @ Rd.T @ (R.T @ v - pd) - hat_map(w) @ R.T @ dpd + R.T @ ddpd
         term3 = dRd.T @ R + Rd.T @ R @ hat_map(w) + hat_map(w) @ R.T @ Rd - R.T @ dRd
         term4 = - hat_map(w) @ R.T @ (p - pd) + v - R.T @ dpd
-        dvd_star = term2 - zeta * term4
-        dwd_star = vee_map(term1 - zeta * term3).reshape((-1,))
+        dvd_star = term2 - zeta_v * term4
+        dwd_star = vee_map(term1 - zeta_w * term3).reshape((-1,))
 
         dVd_star[:3] = dvd_star
         dVd_star[3:] = dwd_star
 
         return Vd_star, dVd_star
 
-    def torque_to_velocity(self, tau, dt):
-        """从扭矩 tau 计算目标速度 dq_new"""
-        # 获取当前关节位置和速度
-        q = self.data.qpos.copy()[:self.model.nv]  # 关节位置
-        dq = self.data.qvel.copy()[:self.model.nv]  # 关节速度
-        
-        # 获取质量矩阵M
-        M = np.zeros((self.model.nv, self.model.nv))
-        mujoco.mj_fullM(self.model, M, self.data.qM)
-        
-        # 获取科氏力+离心力+重力项 (qfrc_bias)
-        qfrc_bias = self.data.qfrc_bias.copy()[:self.model.nv]
-        
-        # 计算加速度 ddq = pinv(M) @ (tau - qfrc_bias)
-        tau_array = np.array(tau).reshape(-1,)
-        ddq = np.linalg.pinv(M) @ (tau_array - qfrc_bias)
-        
-        # 积分速度 dq_new = dq + ddq * dt
-        dq_new = dq + ddq * dt
-        
-        return dq_new
 
     def step(self):
         self.robot_state.update()
 
         tau_cmd = self.geometric_unified_force_impedance_control()
-        # V = self.torque_to_velocity(tau_cmd, self.dt)
         gripper = 0.03
 
         self.robot_state.set_control_torque(tau_cmd, gripper) # 机器人力矩控制
@@ -604,6 +600,22 @@ class RobotEnv:
 
         if self.show_viewer:
             self.viewer.sync()
+
+        q = self.data.qpos[:6].copy()
+        dq = self.data.qvel[:6].copy()
+
+        q_min = self.model.jnt_range[:6, 0]
+        q_max = self.model.jnt_range[:6, 1]
+
+        if np.any((q - q_min < 0.05) | (q_max - q < 0.05)):
+            print("===== JOINT NEAR LIMIT =====")
+            print("step:", self.golbal_steps)
+            print("q rad:", q)
+            print("q deg:", np.rad2deg(q))
+            print("q_min deg:", np.rad2deg(q_min))
+            print("q_max deg:", np.rad2deg(q_max))
+            print("margin low deg:", np.rad2deg(q - q_min))
+            print("margin high deg:", np.rad2deg(q_max - q))
 
         obs = {}
         # Put observables in the obs variable
@@ -679,6 +691,47 @@ class RobotEnv:
         Fd = np.array([0, 0, fz, 0, 0, 0])
         return Fd
 
+    def check_task_success(self):
+
+        p, R = self.robot_state.get_pose()
+
+        t = self.max_time
+
+        pd = self.pd_t(t).reshape(-1)
+        Rd = self.Rd_t(t)
+
+        # -----------------------------
+        # position error
+        # -----------------------------
+        pos_err = np.linalg.norm(p - pd)
+
+        # -----------------------------
+        # rotation error
+        # -----------------------------
+        rot_err_mat = Rd.T @ R
+
+        trace_val = np.clip(
+            (np.trace(rot_err_mat) - 1) / 2,
+            -1.0,
+            1.0
+        )
+
+        rot_err = np.arccos(trace_val)
+
+        # -----------------------------
+        # success threshold
+        # -----------------------------
+        success = (
+            pos_err < 0.002
+        )
+
+        print("================================")
+        print(f"Final Pos Error : {pos_err:.6f}")
+        print(f"Final Rot Error : {np.rad2deg(rot_err):.3f}")
+        print(f"Task Success    : {success}")
+        print("================================")
+
+        return success
 
     def geometric_unified_force_impedance_control(self):
         Jb = self.robot_state.get_body_jacobian() # 雅可比矩阵
@@ -728,7 +781,6 @@ class RobotEnv:
         fR = vee_map(KR @ Rd.T @ R - R.T @ Rd @ KR)
 
         fg = np.vstack((fp,fR))
-
         gd_bar = np.eye(4)
         t = self.iter * self.dt
         gd_bar[:3,:3] = self.Rd_t(t)
@@ -738,27 +790,27 @@ class RobotEnv:
         Fe, d_Fe = self.get_FT_value(return_derivative=True)
         # print("Fe : ", Fe)
         # print("d_Fe : ", d_Fe)
-        print("Fe : ", Fe)
+        # print("Fe : ", Fe)
         Fe = Fe.reshape((-1,1))
         d_Fe = d_Fe.reshape((-1,1))
-        # force_x = Fe[0]
-        # force_y = Fe[1]
-        # force_z = Fe[2]
-        # torque_x = Fe[3]
-        # torque_y = Fe[4]
-        # torque_z = Fe[5]
-        # self.writer.add_scalars("force_x",
-        #                         {"force_x": force_x}, self.golbal_steps)
-        # self.writer.add_scalars("force_y",
-        #                         {"force_y": force_y}, self.golbal_steps)
-        # self.writer.add_scalars("force_z",
-        #                         {"force_z": force_z}, self.golbal_steps)
-        # self.writer.add_scalars("torque_x",
-        #                         {"torque_x": torque_x}, self.golbal_steps)
-        # self.writer.add_scalars("torque_y",
-        #                         {"torque_y": torque_y}, self.golbal_steps)
-        # self.writer.add_scalars("torque_z",
-        #                         {"torque_z": torque_z}, self.golbal_steps)   
+        force_x = Fe[0]
+        force_y = Fe[1]
+        force_z = Fe[2]
+        torque_x = Fe[3]
+        torque_y = Fe[4]
+        torque_z = Fe[5]
+        self.writer.add_scalars("force_x",
+                                {"force_x": force_x}, self.golbal_steps)
+        self.writer.add_scalars("force_y",
+                                {"force_y": force_y}, self.golbal_steps)
+        self.writer.add_scalars("force_z",
+                                {"force_z": force_z}, self.golbal_steps)
+        self.writer.add_scalars("torque_x",
+                                {"torque_x": torque_x}, self.golbal_steps)
+        self.writer.add_scalars("torque_y",
+                                {"torque_y": torque_y}, self.golbal_steps)
+        self.writer.add_scalars("torque_z",
+                                {"torque_z": torque_z}, self.golbal_steps)   
         # NOTE(JS) Working is version is that to put e_force = - Fe - Fd, with the Fe = -self.robot_state.get_ee_force()
         # Fd should be positive as well
 
@@ -777,8 +829,6 @@ class RobotEnv:
         #2.5 Apply shaping function to the force control input
         f_d = Fd_star[:3].reshape((-1,))
         m_d = Fd_star[3:].reshape((-1,))
-
-        t = self.iter * self.dt
 
         if self.iter % self.pointcloud_capture_every == 0:
             point_cloud = self.capture_point_cloud()
@@ -800,21 +850,39 @@ class RobotEnv:
         gd_t[:3,3] = self.pd_t(t).reshape((-1,))
         eg = self.get_eg(g, gd_t)
 
+        # 位置跟踪
+        self.writer1.add_scalars("p_x",
+                {"p_x": p[0]}, self.golbal_steps)
+        self.writer1.add_scalars("p_y",
+                {"p_y": p[1]}, self.golbal_steps)
+        self.writer1.add_scalars("p_z",
+                {"p_z": p[2]}, self.golbal_steps)
+        
+        self.writer2.add_scalars("p_x",
+                {"pd_x": self.pd_t(t)[0]}, self.golbal_steps)
+        self.writer2.add_scalars("p_y",
+                {"pd_y": self.pd_t(t)[1]}, self.golbal_steps)
+        self.writer2.add_scalars("p_z",
+                {"pd_z": self.pd_t(t)[2]}, self.golbal_steps)
+        
+        # 姿态跟踪
+        r = RT.from_matrix(R).as_euler('xyz', degrees=True)
+        rd = RT.from_matrix(self.Rd_t(t)).as_euler('xyz', degrees=True)
+        # r[0] = r[0] % 360 # 将角度限制在 [0, 360], 避免跳变
+        self.writer1.add_scalars("r_x",
+                {"r_x": r[0]}, self.golbal_steps)
+        self.writer1.add_scalars("r_y",
+                {"r_y": r[1]}, self.golbal_steps)
+        self.writer1.add_scalars("r_z",
+                {"r_z": r[2]}, self.golbal_steps)
+        
+        self.writer2.add_scalars("r_x",
+                {"rd_x": rd[0]}, self.golbal_steps)
+        self.writer2.add_scalars("r_y",
+                {"rd_y": rd[1]}, self.golbal_steps)
+        self.writer2.add_scalars("r_z",
+                {"rd_z": rd[2]}, self.golbal_steps)
 
-        # self.writer1.add_scalars("p_x",
-        #         {"p_x": p[0]}, self.golbal_steps)
-        # self.writer1.add_scalars("p_y",
-        #         {"p_y": p[1]}, self.golbal_steps)
-        # self.writer1.add_scalars("p_z",
-        #         {"p_z": p[2]}, self.golbal_steps)
-        
-        # self.writer2.add_scalars("p_x",
-        #         {"pd_x": self.pd_t(t)[0]}, self.golbal_steps)
-        # self.writer2.add_scalars("p_y",
-        #         {"pd_y": self.pd_t(t)[1]}, self.golbal_steps)
-        # self.writer2.add_scalars("p_z",
-        #         {"pd_z": self.pd_t(t)[2]}, self.golbal_steps)
-        
         ep = eg[:3,0]
         eR = eg[3:,0]
 
@@ -975,10 +1043,11 @@ if __name__ == "__main__":
     inertia_shaping = False
     episode_number = 50
     
-    task = 'insertion'  # "regulation", 'circle', 'line'
+    task = 'bolt'  # "regulation", 'circle', 'line'
 
-    assert task in ['regulation', 'circle', 'line', 'sphere', 'insertion']
+    assert task in ['regulation', 'circle', 'line', 'sphere', 'insertion', "bolt"]
 
+    save_dir = "/media/zhou/Elements SE/VLA/boltnut_demos_vis_random_start"
     if task == 'regulation':
         max_time = 6
     elif task == 'line':
@@ -988,17 +1057,30 @@ if __name__ == "__main__":
     elif task == 'sphere':
         max_time = 10
         fz = 10
+    elif task == 'insertion':
+        max_time = 6
+        fz = 5
+    elif task == 'bolt':
+        max_time = 16
+        fz = 5
     else:
         max_time = 6
         fz = 5
 
     RE = RobotEnv(robot_name, show_viewer = show_viewer, max_time = max_time, fz = fz, 
-                  fix_camera = True, task = task, randomized_start=randomized_start, inertia_shaping = inertia_shaping)
+                  fix_camera = True, task = task, randomized_start=randomized_start, 
+                  inertia_shaping = inertia_shaping, save_dir=save_dir)
     
     for episode in range(0, 100):
         RE.reset()
         RE.run()
-        RE.demo_recorder.save(f"bolt_demo_{episode:04d}")
+        success = RE.check_task_success()
+
+        if success:
+            RE.demo_recorder.save(f"bolt_demo_{episode:04d}")
+            print(f"[SAVE] episode {episode}")
+        else:
+            print(f"[DROP] episode {episode}")
         RE.demo_recorder.reset()
 
     if show_viewer:

@@ -1,13 +1,11 @@
+from gufic_env.flow_matching.dataset import rotmat_batch_to_rot6d, uniform_sample_one_frame, get_hand_eye_from_xml, pointcloud_cam_to_world_batch
 import os
-import math
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
-import torch.nn as nn
 
 from gufic_env.flow_matching.model import VelocityFMMLP, VelocityFMTransformer, VelocityFMCondUnet1D, VisionDeltaPoseNet
 from gufic_env.flow_matching.config import TrainConfig
-from gufic_env.flow_matching.dataset import rotmat_batch_to_rot6d, uniform_sample_one_frame, get_hand_eye_from_xml, pointcloud_cam_to_world_batch
 from gufic_env.flow_matching.diffusion_model.vision.pointnet import PointNetBackbone
 # ============================================================
 # Config / checkpoint loading
@@ -216,8 +214,11 @@ def sample_velocity_trajectory(
 
         fe_cond = torch.from_numpy(cond_np).to(device).float()   # [1, cond_dim]
         # 当前状态 x_now 就是 cond_main 的前 9 维
-        x_now = fe_cond[:, :9]
+        x_now_ = fe_cond[:, :9]
 
+        now_left = 9 * (cfg.x_hist_len - 1)
+        now_right = 9 * cfg.x_hist_len
+        x_now = fe_cond[:, now_left : now_right]
         # 可选检查
         if hasattr(cfg, "cond_dim"):
             if fe_cond.shape[-1] != cfg.cond_dim:
@@ -575,8 +576,10 @@ def run_direct_field_inference(
                 pad_pc = np.repeat(cond_pc[0:1], pad_len, axis=0)
                 cond_pc = np.concatenate([pad_pc, cond_pc], axis=0)
 
-            pc_world = pointcloud_cam_to_world_batch(cond_pc, p_raw, R_raw, R_ec, t_ec)
-            pc_ee = np.einsum("tji,tpj->tpi", R_raw, pc_world[..., :3] - p_raw[:, None, :])  # R^T (x_w - p)
+            p_now_raw = demo["p"][i : i + 1].astype(np.float32)
+            R_now_raw = demo["R"][i : i + 1].astype(np.float32)
+            pc_world = pointcloud_cam_to_world_batch(cond_pc, p_now_raw, R_now_raw, R_ec, t_ec)
+            pc_ee = np.einsum("tji,tpj->tpi", R_now_raw, pc_world[..., :3] - p_now_raw[:, None, :])  # R^T (x_w - p)
             pc_ee = pc_ee / 0.1
             cond_pc = np.stack(
                 [uniform_sample_one_frame(pc_t, 2048, use_xyz_only=True) for pc_t in pc_ee],
@@ -707,12 +710,20 @@ if __name__ == "__main__":
     # type = "fixed_start"
     type = "random_start"
     robot_name = 'indy7'
-    robot_task = 'sphere'
+    robot_task = 'insertion'
+    if robot_task == 'sphere':
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best19.pt"
+        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo/bolt_demo_0098.npz"
+        out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_vis_pRFe_{type}"
+    elif robot_task == 'insertion':
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_insertion_vis_pRFe_{type}/cfm_transformer_{type}_best2.pt"
+        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/insertion_vis_demo/bolt_demo_0140.npz"
+        out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_insertion_vis_pRFe_{type}"
 
     run_direct_field_inference(
-        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best19.pt",
-        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo/bolt_demo_0098.npz",
-        out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_vis_pRFe_{type}",
+        ckpt_path=ckpt_path,
+        demo_path=demo_path,
+        out_dir=out_dir,
         max_points=10000,
         steps=10,
         seed=42,

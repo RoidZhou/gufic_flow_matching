@@ -14,6 +14,8 @@ def load_xml(robot_name, task):
     elif robot_name == 'indy7':
         if task == "sphere":
             model_path = dir + "gufic_env/mujoco_models/Indy7_wiping_sphere.xml"
+        elif task == "insertion":
+            model_path = dir + "gufic_env/mujoco_models/Indy7_insertion.xml"
         else:
             model_path = dir + "gufic_env/mujoco_models/Indy7_wiping.xml"
     elif robot_name == 'panda':

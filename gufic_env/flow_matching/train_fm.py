@@ -513,8 +513,8 @@ if __name__ == "__main__":
     type = "random_start"
 
     cfg = TrainConfig(
-        train_demo_dir="/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo",
-        val_demo_dir="/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo",
+        train_demo_dir="/home/zhou/autolab/GUFIC_mujoco-main/bolt_peg_vis_demo",
+        val_demo_dir="/home/zhou/autolab/GUFIC_mujoco-main/bolt_peg_vis_demo",
         type=type,
         epochs=1000,
         batch_size=8,

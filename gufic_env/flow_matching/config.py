@@ -39,7 +39,7 @@ class TrainConfig:
     input_transform: bool = False
     pc_scale: float = 0.5
     # 条件 = 最近 K 步力序列，展平后维度 = 6*K
-    x_hist_len: int = 16
+    x_hist_len: int = 4
     pc_hist_len: int =1
     force_hist_len: int = 16
     cond_dim: int = 9 * x_hist_len + 6 * force_hist_len # K=16 步 6 维 力历史，1 步 9 维状态

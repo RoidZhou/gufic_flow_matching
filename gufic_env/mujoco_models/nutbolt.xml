@@ -1,0 +1,112 @@
+<mujoco model="m20_assembly">
+
+  <extension>
+
+    <!-- M20 bolt -->
+    <plugin plugin="mujoco.sdf.bolt">
+      <instance name="bolt">
+        <config key="major_radius" value="0.0098"/>
+        <config key="minor_radius" value="0.0083"/>
+        <config key="pitch" value="0.0025"/>
+        <config key="length" value="0.05"/>
+        <config key="head_radius" value="0.015"/>
+        <config key="head_height" value="0.012"/>
+        <config key="phase" value="0"/>
+      </instance>
+    </plugin>
+
+    <!-- M20 nut -->
+    <plugin plugin="mujoco.sdf.nut">
+      <instance name="nut">
+        <config key="inner_major_radius" value="0.0103"/>
+        <config key="inner_minor_radius" value="0.0090"/>
+        <config key="pitch" value="0.0025"/>
+        <config key="height" value="0.018"/>
+        <config key="outer_radius" value="0.015"/>
+        <config key="phase" value="0"/>
+      </instance>
+    </plugin>
+
+  </extension>
+
+  <compiler autolimits="true"/>
+
+  <option
+      timestep="0.001"
+      gravity="0 0 -9.81"
+      iterations="200"
+      noslip_iterations="50"
+      sdf_iterations="10"
+      sdf_initpoints="20"
+  />
+
+  <visual>
+    <map force="0.05"/>
+  </visual>
+
+  <asset>
+
+    <mesh name="bolt_mesh">
+      <plugin instance="bolt"/>
+    </mesh>
+
+    <mesh name="nut_mesh">
+      <plugin instance="nut"/>
+    </mesh>
+
+  </asset>
+
+  <default>
+    <geom solref="0.01 1" solimp=".95 .99 .0001" friction="0.01"/>
+  </default>
+
+  <worldbody>
+
+    <light name="left" pos="-1 0 2"/>
+    <light name="right" pos="1 0 2"/>
+
+    <camera
+        name="cam"
+        pos="0.12 -0.18 0.08"
+        xyaxes="0.83 0.55 0 -0.20 0.30 0.93"
+        fovy="35"/>
+
+    <!-- 固定 bolt -->
+    <!-- 注意：翻转 180 度 -->
+    <body name="bolt_body"
+          pos="0 0 0"
+          euler="180 0 0">
+
+      <geom
+          type="sdf"
+          mesh="bolt_mesh"
+          rgba="0.7 0.7 0.7 1">
+
+        <plugin instance="bolt"/>
+
+      </geom>
+
+    </body>
+
+    <!-- nut -->
+    <!-- 初始已经套在 bolt 上 -->
+    <body name="nut_body"
+          pos="0 0 0.055"
+          quat="-0.000212626 0.999996 -0.00200453 0.00185878">
+
+      <joint type="free" damping="30"/>
+
+      <geom
+          type="sdf"
+          mesh="nut_mesh"
+          rgba="0.83 0.68 0.4 1">
+
+        <plugin instance="nut"/>
+
+      </geom>
+
+    </body>
+
+  </worldbody>
+
+</mujoco>

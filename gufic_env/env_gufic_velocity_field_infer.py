@@ -184,15 +184,21 @@ class RobotEnv:
 
         self.z_init_offset = -0.1
 
-        self.pd_t, self.Rd_t, self.dpd_t, self.dRd_t, self.ddpd_t, self.ddRd_t = initialize_trajectory(task=self.task)
-
         self.show_viewer = show_viewer
         self.load_xml()
 
         self.robot_state = RobotState(self.model, self.data, "end_effector", self.robot_name)
 
+        if self.task == 'insertion':
+            self.p_init = np.array([0.50, 0.0, 0.225])
+            self.R_init = np.array([[0, 1, 0],
+                               [1, 0, 0],
+                               [0, 0, -1]])
+            self.set_robot_to_pose(self.p_init, self.R_init)
+
         self.dt = self.model.opt.timestep
         self.max_iter = int(max_time / self.dt)
+        self.max_time = max_time
         self.iter = 0
         self.velocity_model = None
         self.prev_Vd_star_fm = np.zeros((6,), dtype=np.float32)
@@ -203,9 +209,8 @@ class RobotEnv:
         self.Fe = np.zeros((6, 1))
         self.reset()
 
-        self.Kp, self.KR, self.Kd, self.kp_force, self.kd_force, self.ki_force, self.zeta = set_gains(
-            controller='GUFIC', task=self.task
-        )
+        self.Kp, self.KR, self.Kd, self.kp_force, self.kd_force, self.ki_force, self.zeta_v, self.zeta_w = set_gains(controller = 'GUFIC', task = self.task)
+
 
         self.int_sat = 50
         self.e_force_prev = np.zeros((6, 1))
@@ -449,6 +454,7 @@ class RobotEnv:
                     pad_pc = np.repeat(cond_pc[0:1], pad_len, axis=0)
                     cond_pc = np.concatenate([pad_pc, cond_pc], axis=0)
 
+
                 pc_world = pointcloud_cam_to_world_batch(cond_pc, p_raw, R_raw, self.R_ec, self.t_ec)
                 pc_ee = np.einsum("tji,tpj->tpi", R_raw, pc_world[..., :3] - p_raw[:, None, :])  # R^T (x_w - p)
                 cond_pc = pc_ee / 0.1
@@ -464,7 +470,11 @@ class RobotEnv:
                     cond = cond[None, :]
 
                 cond = torch.from_numpy(cond).to(self.fm_device).float()
-                x_now = cond[:, :9]
+                # x_now = cond[:, :9]
+                now_left = 9 * (self.x_hist_len - 1)
+                now_right = 9 * self.x_hist_len
+                x_now = cond[:, now_left : now_right]
+
                 cond_pc = torch.from_numpy(cond_pc).to(self.fm_device).float()
                 cond_pc = cond_pc.unsqueeze(0)   # [B, P, C]
                 # pc_feat = self.obs_encoder(cond_pc)   # [1, embed_dim]
@@ -536,6 +546,8 @@ class RobotEnv:
         elif self.robot_name == 'indy7':
             if self.task == "sphere":
                 model_path = dir + "gufic_env/mujoco_models/Indy7_wiping_sphere.xml"
+            elif self.task == "insertion":
+                model_path = dir + "gufic_env/mujoco_models/Indy7_insertion.xml"
             else:
                 model_path = dir + "gufic_env/mujoco_models/Indy7_wiping.xml"
 
@@ -703,14 +715,48 @@ class RobotEnv:
             width=960,
             height=720
         )
-    
+
+    def set_robot_to_pose(self, p_des, R_des):
+        """
+        通过 IK 将机器人直接设置到指定末端位姿。
+        p_des: shape (3,)
+        R_des: shape (3, 3)
+        """
+        p_des = np.asarray(p_des, dtype=np.float64).reshape(3)
+        R_des = np.asarray(R_des, dtype=np.float64).reshape(3, 3)
+
+        if self.model.nv == 6:
+            q0 = np.array([0, 0, -np.pi / 2, 0, -np.pi / 2, np.pi / 2])
+        elif self.model.nv == 8:
+            q0 = np.array([0, 0, -np.pi / 2, 0, -np.pi / 2, np.pi / 2, 0, 0])
+        elif self.model.nv == 10:
+            q0 = np.array([0, 0, -np.pi / 2, 0, -np.pi / 2, np.pi / 2, 0, 0, 0, 0])
+        else:
+            q0 = np.zeros(self.model.nv)
+
+        self.robot_state.gauss_newton_IK(p_des, R_des, q0)
+
+        mujoco.mj_forward(self.model, self.data)
+        self.robot_state.update()
+
+        if self.show_viewer and self.viewer is not None:
+            self.viewer.sync()
+
     def reset(self, angle_prefix=None):
         self.iter = 0
-        self.prev_Vd_star_fm[:] = 0.0
-        self.prev_dVd_star_fm[:] = 0.0
 
-        pd = self.pd_t(0)
-        Rd = self.Rd_t(0)
+        if self.task == "insertion":
+            pd = self.p_init
+            Rd = self.R_init
+        else:
+            # 先生成轨迹，保证非 insertion 任务能取 pd_t(0), Rd_t(0)
+            self.pd_t, self.Rd_t, self.dpd_t, self.dRd_t, self.ddpd_t, self.ddRd_t = initialize_trajectory(
+                task=self.task,
+                max_time=self.max_time,
+                robot_state=self.robot_state
+            )
+            pd = self.pd_t(0)
+            Rd = self.Rd_t(0)
 
         if self.randomized_start:
             rand_xy = 2 * (np.random.rand(2,) - 0.5) * 0.05
@@ -719,19 +765,37 @@ class RobotEnv:
             rand_xy = np.array([0.05, -0.05])
             rand_rpy = np.array([15, -15, 15]) * np.pi / 180
 
-        Rx = np.array([[1, 0, 0], [0, np.cos(rand_rpy[0]), -np.sin(rand_rpy[0])], [0, np.sin(rand_rpy[0]), np.cos(rand_rpy[0])]])
-        Ry = np.array([[np.cos(rand_rpy[1]), 0, np.sin(rand_rpy[1])], [0, 1, 0], [-np.sin(rand_rpy[1]), 0, np.cos(rand_rpy[1])]])
-        Rz = np.array([[np.cos(rand_rpy[2]), -np.sin(rand_rpy[2]), 0], [np.sin(rand_rpy[2]), np.cos(rand_rpy[2]), 0], [0, 0, 1]])
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(rand_rpy[0]), -np.sin(rand_rpy[0])],
+            [0, np.sin(rand_rpy[0]),  np.cos(rand_rpy[0])]
+        ])
+        Ry = np.array([
+            [ np.cos(rand_rpy[1]), 0, np.sin(rand_rpy[1])],
+            [0, 1, 0],
+            [-np.sin(rand_rpy[1]), 0, np.cos(rand_rpy[1])]
+        ])
+        Rz = np.array([
+            [np.cos(rand_rpy[2]), -np.sin(rand_rpy[2]), 0],
+            [np.sin(rand_rpy[2]),  np.cos(rand_rpy[2]), 0],
+            [0, 0, 1]
+        ])
 
-        p_init = pd.reshape((-1, 1)) + Rd @ np.array([rand_xy[0], rand_xy[1], self.z_init_offset]).reshape(-1, 1)
+        p_init = pd.reshape((-1, 1)) + Rd @ np.array(
+            [rand_xy[0], rand_xy[1], self.z_init_offset]
+        ).reshape(-1, 1)
+
         R_init = Rd @ Rz @ Ry @ Rx
-
         p_init = p_init.reshape((-1,))
 
         if self.model.nv == 8:
-            q0 = np.array([0, 0, -np.pi / 2, 0, -np.pi / 2, np.pi / 2, 0, 0])
+            q0 = np.array([0, 0, -np.pi/2, 0, -np.pi/2, np.pi/2, 0, 0])
         elif self.model.nv == 6:
-            q0 = np.array([0, 0, -np.pi / 2, 0, -np.pi / 2, np.pi / 2])
+            q0 = np.array([0, 0, -np.pi/2, 0, -np.pi/2, np.pi/2])
+        elif self.model.nv == 10:
+            q0 = np.array([0, 0, -np.pi/2, 0, -np.pi/2, np.pi/2, 0, 0, 0, 0])
+        else:
+            q0 = np.zeros(self.model.nv)
 
         self.robot_state.gauss_newton_IK(p_init, R_init, q0)
 
@@ -743,6 +807,14 @@ class RobotEnv:
 
         self.robot_state.update()
 
+        # insertion 会从当前真实初始位姿开始
+        if self.task == "insertion":
+            self.pd_t, self.Rd_t, self.dpd_t, self.dRd_t, self.ddpd_t, self.ddRd_t = initialize_trajectory(
+                task=self.task,
+                max_time=self.max_time,
+                robot_state=self.robot_state
+            )
+
         p, R = self.robot_state.get_pose()
 
         self.gd = np.eye(4)
@@ -752,8 +824,44 @@ class RobotEnv:
         if self.show_viewer:
             self.viewer.sync()
 
-        if self.record_demos and self.demo_recorder is not None:
-            self.demo_recorder.reset()
+        self.int_sat = 50
+
+        ## For the force tracking
+        self.e_force_prev = np.zeros((6,1))
+        self.int_force_prev = np.zeros((6,1))
+
+        ## For the energy tank
+        self.T_f_low = 0.5
+        self.T_f_high = 20
+        self.delta_f = 1
+
+        self.T_i_low = 0.5
+        self.T_i_high = 20
+        self.delta_i = 1
+
+        T_i_init = 10
+        T_f_init = 10
+
+        if self.task == 'sphere':
+            T_i_init = 90
+            self.T_i_high = 100
+
+        self.x_tf = np.sqrt(2 * T_f_init)
+        self.x_ti = np.sqrt(2 * T_i_init)
+
+        self.T_f = 0.5 * self.x_tf**2
+        self.T_i = 0.5 * self.x_ti**2
+
+        self.d_max = 0.03
+        self.eR_norm_max = 0.05
+
+        ####### Dummy for the printing
+        self.Ff_list = []
+        self.Vb_list = []
+        self.Ff_activation = []
+        self.rho_list = []
+        self.Fd_star_list = []
+        self.Fi_activation = []
 
         print('Initialization Complete')
         time.sleep(2)
@@ -880,7 +988,6 @@ class RobotEnv:
         self.robot_state.update()
 
         tau_cmd = self.geometric_unified_force_impedance_control()
-        V = self.torque_to_velocity(tau_cmd, self.dt)
         gripper = 0.03
 
         self.robot_state.set_control_torque(tau_cmd, gripper)
@@ -1212,7 +1319,7 @@ if __name__ == "__main__":
     show_viewer = True
     randomized_start = True
     inertia_shaping = False
-    task = 'sphere'
+    task = 'insertion'
     if randomized_start:
         type = "random_start"
     else:
@@ -1231,9 +1338,8 @@ if __name__ == "__main__":
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm/fm_best.pt"
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_transformer_fixed_start/fm_best_0.025.pt"
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_transformer_fixed_start/fm_best_4.21.pt"
-    ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best19.pt"
 
-    assert task in ['regulation', 'circle', 'line', 'sphere']
+    assert task in ['regulation', 'circle', 'line', 'sphere', 'insertion']
 
     if task == 'regulation':
         max_time = 6
@@ -1243,6 +1349,11 @@ if __name__ == "__main__":
         max_time = 10
     elif task == 'sphere':
         max_time = 10
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best21.pt"
+    elif task == 'insertion':
+        max_time = 6
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_insertion_vis_pRFe_{type}/cfm_transformer_{type}_best1.pt"
+
     save_tensorboard = True
 
     RE = RobotEnv(
