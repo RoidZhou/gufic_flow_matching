@@ -195,6 +195,15 @@ class RobotEnv:
                                [1, 0, 0],
                                [0, 0, -1]])
             self.set_robot_to_pose(self.p_init, self.R_init)
+        elif self.task == 'bolt':
+            # self.p_init = np.array([0.50, 0.0, 0.225])
+            self.p_init = np.array([0.50, 0.0, 0.29])
+            Rd_default = np.array([[0, 1, 0],
+                               [1, 0, 0],
+                               [0, 0, -1]])
+            U, _, Vt = np.linalg.svd(Rd_default)
+            self.R_init = U @ Vt
+            self.set_robot_to_pose(self.p_init, self.R_init)
 
         self.dt = self.model.opt.timestep
         self.max_iter = int(max_time / self.dt)
@@ -209,7 +218,7 @@ class RobotEnv:
         self.Fe = np.zeros((6, 1))
         self.reset()
 
-        self.Kp, self.KR, self.Kd, self.kp_force, self.kd_force, self.ki_force, self.zeta_v, self.zeta_w = set_gains(controller = 'GUFIC', task = self.task)
+        self.Kp, self.KR, self.Kd, self.kp_force, self.kd_force, self.ki_force, self.zeta_v, self.zeta_w = set_gains(controller = 'GUFIC', task = self.task, sim_mode = "infer")
 
 
         self.int_sat = 50
@@ -548,6 +557,8 @@ class RobotEnv:
                 model_path = dir + "gufic_env/mujoco_models/Indy7_wiping_sphere.xml"
             elif self.task == "insertion":
                 model_path = dir + "gufic_env/mujoco_models/Indy7_insertion.xml"
+            elif self.task == "bolt":
+                model_path = dir + "gufic_env/mujoco_models/Indy7_nutbolt.xml"
             else:
                 model_path = dir + "gufic_env/mujoco_models/Indy7_wiping.xml"
 
@@ -745,7 +756,7 @@ class RobotEnv:
     def reset(self, angle_prefix=None):
         self.iter = 0
 
-        if self.task == "insertion":
+        if self.task in ["insertion", "bolt"]:
             pd = self.p_init
             Rd = self.R_init
         else:
@@ -808,7 +819,7 @@ class RobotEnv:
         self.robot_state.update()
 
         # insertion 会从当前真实初始位姿开始
-        if self.task == "insertion":
+        if self.task in ["insertion", "bolt"]:
             self.pd_t, self.Rd_t, self.dpd_t, self.dRd_t, self.ddpd_t, self.ddRd_t = initialize_trajectory(
                 task=self.task,
                 max_time=self.max_time,
@@ -1319,7 +1330,7 @@ if __name__ == "__main__":
     show_viewer = True
     randomized_start = True
     inertia_shaping = False
-    task = 'insertion'
+    task = 'bolt'
     if randomized_start:
         type = "random_start"
     else:
@@ -1339,7 +1350,7 @@ if __name__ == "__main__":
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_transformer_fixed_start/fm_best_0.025.pt"
     # ckpt_path="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_fm_transformer_fixed_start/fm_best_4.21.pt"
 
-    assert task in ['regulation', 'circle', 'line', 'sphere', 'insertion']
+    assert task in ['regulation', 'circle', 'line', 'sphere', 'insertion', 'bolt']
 
     if task == 'regulation':
         max_time = 6
@@ -1349,10 +1360,16 @@ if __name__ == "__main__":
         max_time = 10
     elif task == 'sphere':
         max_time = 10
+        fz=10
         ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best21.pt"
     elif task == 'insertion':
         max_time = 6
-        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_insertion_vis_pRFe_{type}/cfm_transformer_{type}_best1.pt"
+        fz=10
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_insertion_vis_pRFe_{type}/cfm_transformer_{type}_best3.pt"
+    elif task == 'bolt':
+        max_time = 16
+        fz=10
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_boltnut_vis_pRFe_{type}/cfm_transformer_{type}_best4.pt"
 
     save_tensorboard = True
 
@@ -1361,7 +1378,7 @@ if __name__ == "__main__":
         model,
         show_viewer=show_viewer,
         max_time=max_time,
-        fz=10,
+        fz=fz,
         fix_camera=True,
         task=task,
         randomized_start=randomized_start,

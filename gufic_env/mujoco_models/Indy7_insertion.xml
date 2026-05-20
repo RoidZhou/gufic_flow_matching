@@ -130,7 +130,7 @@
                                                 <!-- <joint axis="1 0 0" pos="0 0 0.200" name="slip" range="-3.14 3.14" damping="1" type="hinge"/> -->
                                                 <!-- <joint axis="0 0 1" pos="0 0 0.200" name="slip2" range="-0.03 0.03" damping="50" type="slide"/> -->
                                                 <!-- <geom name="peg_pole" pos="0.0 0.0 0.220" type="cylinder" size="0.015 0.05" contype="1" euler="0 0 0" conaffinity="1" condim = "3" rgba="0.6 0.6 0.0 1" friction="0.3" solimp="0.99 0.99 0.001" solref="0.001 1"/> -->
-                                                <geom name="peg_geom" pos="0.0 0.0 0.270" type="mesh" mesh="peg" contype='1' conaffinity='1' condim='6' solimp="0.99 0.99 0.001" solref="0.001 1" margin="0.0005" rgba="0.6 0.6 0.0 1"/>
+                                                <geom name="peg_geom" pos="0.0 0.0 0.270" type="mesh" mesh="peg" contype='1' conaffinity='1' condim='6' solimp="0.99 0.99 0.001" solref="0.001 1" margin="0.00005" rgba="0.6 0.6 0.0 1"/>
                                                 <inertial pos = "0 0 0" euler = "0 0 0" mass = "0.01" diaginertia="0.0015 0.0015 0.0015"/>
                                                 <site name="end_effector" type="sphere" size="0.005" pos="0.0 0 0.270" euler="0 0 0" rgba="1 0 0 1.00"/>
                                         </body>
@@ -144,12 +144,12 @@
         </body>
 
         <body name="hole" pos="0.5 0 0.11">
-            <geom name='hole_base_geom' type="box" size="0.075 0.075 0.015" pos="0 0 0" rgba="0 0 1 1" friction="0.3" contype='1' conaffinity='1' condim='6' solimp="0.99 0.99 0.001" solref="0.001 1" margin="0.0005"/>
+            <geom name='hole_base_geom' type="box" size="0.075 0.075 0.015" pos="0 0 0" rgba="0 0 1 1" friction="0.3" contype='1' conaffinity='1' condim='6' solimp="0.99 0.99 0.001" solref="0.001 1" margin="0.00005"/>
             <site name="target" type="sphere" size="0.01" pos="0.0 0 0.0" euler="0 0 0" rgba="0 0 1 1.00"/>
-            <geom name='hole_geom_1' type="mesh" pos="0 0 0.025" mesh="hole" rgba = "0 0 1 1" friction="0.3" contype='1' conaffinity='1' condim='6' solimp="0.99 0.99 0.001" solref="0.001 1" margin="0.0005"/>
-            <geom name='hole_geom_2' type="mesh" pos="0 0 0.025" quat = "0 0 1 0" mesh="hole" rgba = "0 0 1 1" friction="0.3" contype='1' conaffinity='1' condim='6' solimp="0.99 0.99 0.001" solref="0.001 1" margin="0.0005"/>
-            <geom name='hole_geom_3' type="mesh" pos="0 0 0.025" quat = "0 1 1 0" mesh="hole" rgba = "0 0 1 1" friction="0.3" contype='1' conaffinity='1' condim='6' solimp="0.99 0.99 0.001" solref="0.001 1" margin="0.0005"/>
-            <geom name='hole_geom_4' type="mesh" pos="0 0 0.025" quat = "0 -1 1 0" mesh="hole" rgba = "0 0 1 1" friction="0.3" contype='1' conaffinity='1' condim='6' solimp="0.99 0.99 0.001" solref="0.001 1" margin="0.0005"/>
+            <geom name='hole_geom_1' type="mesh" pos="0 0 0.025" mesh="hole" rgba = "0 0 1 1" friction="0.3" contype='1' conaffinity='1' condim='6' solimp="0.99 0.99 0.001" solref="0.001 1" margin="0.00005"/>
+            <geom name='hole_geom_2' type="mesh" pos="0 0 0.025" quat = "0 0 1 0" mesh="hole" rgba = "0 0 1 1" friction="0.3" contype='1' conaffinity='1' condim='6' solimp="0.99 0.99 0.001" solref="0.001 1" margin="0.00005"/>
+            <geom name='hole_geom_3' type="mesh" pos="0 0 0.025" quat = "0 1 1 0" mesh="hole" rgba = "0 0 1 1" friction="0.3" contype='1' conaffinity='1' condim='6' solimp="0.99 0.99 0.001" solref="0.001 1" margin="0.00005"/>
+            <geom name='hole_geom_4' type="mesh" pos="0 0 0.025" quat = "0 -1 1 0" mesh="hole" rgba = "0 0 1 1" friction="0.3" contype='1' conaffinity='1' condim='6' solimp="0.99 0.99 0.001" solref="0.001 1" margin="0.00005"/>
         </body>
 
     </worldbody>

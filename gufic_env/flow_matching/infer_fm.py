@@ -710,15 +710,19 @@ if __name__ == "__main__":
     # type = "fixed_start"
     type = "random_start"
     robot_name = 'indy7'
-    robot_task = 'insertion'
+    robot_task = 'bolt'
     if robot_task == 'sphere':
         ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best19.pt"
         demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo/bolt_demo_0098.npz"
         out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_vis_pRFe_{type}"
     elif robot_task == 'insertion':
-        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_insertion_vis_pRFe_{type}/cfm_transformer_{type}_best2.pt"
-        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/insertion_vis_demo/bolt_demo_0140.npz"
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_insertion_vis_pRFe_{type}/cfm_transformer_{type}_best1.pt"
+        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/insertion_vis_demo/bolt_demo_0171.npz"
         out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_insertion_vis_pRFe_{type}"
+    elif robot_task == 'bolt':
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_boltnut_vis_pRFe_{type}/cfm_transformer_{type}_best2.pt"
+        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/boltnut_vis_demo/bolt_demo_0099.npz"
+        out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_boltnut_vis_pRFe_{type}"
 
     run_direct_field_inference(
         ckpt_path=ckpt_path,

@@ -16,6 +16,8 @@ def load_xml(robot_name, task):
             model_path = dir + "gufic_env/mujoco_models/Indy7_wiping_sphere.xml"
         elif task == "insertion":
             model_path = dir + "gufic_env/mujoco_models/Indy7_insertion.xml"
+        elif task == "bolt":
+                model_path = dir + "gufic_env/mujoco_models/Indy7_nutbolt.xml"
         else:
             model_path = dir + "gufic_env/mujoco_models/Indy7_wiping.xml"
     elif robot_name == 'panda':
@@ -185,12 +187,17 @@ def build_delta_pose_target(
     R_next: np.ndarray,
 ) -> np.ndarray:
     """
-    return: [9] = [delta_p(3), delta_R6d(6)]
+    return: [9] = [delta_p_local(3), delta_R6d(6)]
     """
-    delta_p = (p_next - p_now).astype(np.float32)     # [3]
-    R_rel = R_now.T @ R_next                          # [3,3]
-    delta_r6d = rotmat_to_rot6d_one(R_rel)           # [6]
-    return np.concatenate([delta_p, delta_r6d], axis=0).astype(np.float32)
+    delta_p_local = R_now.T @ (p_next - p_now)
+
+    R_rel = R_now.T @ R_next
+    delta_r6d = rotmat_to_rot6d_one(R_rel)
+
+    return np.concatenate(
+        [delta_p_local.astype(np.float32), delta_r6d],
+        axis=0
+    ).astype(np.float32)
 
 class FlowMatchingDataset(Dataset):
     """

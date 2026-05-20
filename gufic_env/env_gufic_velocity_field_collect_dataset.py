@@ -332,7 +332,7 @@ class RobotEnv:
     def reset(self, angle_prefix=None):
         self.iter = 0
 
-        if self.start_from_random and self.task in ["insertion", "bolt"]:
+        if self.task in ["insertion", "bolt"]:
             pd = self.p_init
             Rd = self.R_init
         else:
@@ -395,7 +395,7 @@ class RobotEnv:
         self.robot_state.update()
 
         # insertion 会从当前真实初始位姿开始
-        if self.start_from_random and self.task in ["insertion", "bolt"]:
+        if self.task in ["insertion", "bolt"]:
             self.pd_t, self.Rd_t, self.dpd_t, self.dRd_t, self.ddpd_t, self.ddRd_t = initialize_trajectory(
                 task=self.task,
                 max_time=self.max_time,
@@ -1071,7 +1071,7 @@ if __name__ == "__main__":
                   fix_camera = True, task = task, randomized_start=randomized_start, 
                   inertia_shaping = inertia_shaping, save_dir=save_dir)
     
-    for episode in range(0, 100):
+    for episode in range(120, 175):
         RE.reset()
         RE.run()
         success = RE.check_task_success()

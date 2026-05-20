@@ -298,7 +298,7 @@ def initialize_trajectory(task, max_time = 10, robot_state = None):
 
     return pd_t, Rd_t, dpd_t, dRd_t, ddpd_t, ddRd_t
 
-def set_gains(controller = "GUFIC", task = "regulation"):
+def set_gains(controller = "GUFIC", task = "regulation", sim_mode = "demonstration"):
     assert controller in ["GUFIC", "GIC"], "Invalid controller"
     assert task in ["regulation", "circle", "line", "sphere", "insertion", "bolt"], "Invalid task"
     
@@ -328,7 +328,10 @@ def set_gains(controller = "GUFIC", task = "regulation"):
             zeta_v = 10
             zeta_w = 10
         elif task in ["bolt"]:
-            Kp = np.eye(3) * np.array([2000, 2000, 2000])
+            if sim_mode == "demonstration":
+                Kp = np.eye(3) * np.array([2000, 2000, 2000]) # demonstration
+            else:
+                Kp = np.eye(3) * np.array([2000, 2000, 20]) # infer
             KR = np.eye(3) * np.array([2000, 2000, 2000])
             Kd = np.eye(6) * np.array([500, 500, 500, 500, 500, 500])
 

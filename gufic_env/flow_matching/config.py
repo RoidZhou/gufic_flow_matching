@@ -13,6 +13,7 @@ class TrainConfig:
     type: str = "fixed_start"
     train_mode: str = "rolling_horizon"  # "fixed_length" or "rolling_horizon"
     model: str = "transformer"  # "mlp" or "transformer" or "unet"
+    task: str = "bolt"  # "wiping", "sphere", "insertion", "bolt"
 
     batch_size: int = 64
     lr: float = 1e-4
@@ -51,6 +52,10 @@ class TrainConfig:
     # 采样步长
     stride: int = 1
 
+    def __post_init__(self):
+        if self.task == "bolt":
+            self.pred_horizon = 400
+            self.stride = 2
     # 混合损失权重
     lambda_vel: float = 1.0
     lambda_fm: float = 0.2
