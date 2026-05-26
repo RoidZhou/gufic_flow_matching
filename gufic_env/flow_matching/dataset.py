@@ -199,6 +199,24 @@ def build_delta_pose_target(
         axis=0
     ).astype(np.float32)
 
+def vee_batch(W: np.ndarray) -> np.ndarray:
+    """
+    W: [T, 3, 3]
+    return: [T, 3]
+    Extract vee(W) from skew-symmetric matrices.
+    """
+    W = np.asarray(W, dtype=np.float32)
+    assert W.ndim == 3 and W.shape[-2:] == (3, 3)
+
+    return np.stack(
+        [
+            W[:, 2, 1],
+            W[:, 0, 2],
+            W[:, 1, 0],
+        ],
+        axis=-1
+    ).astype(np.float32)
+
 class FlowMatchingDataset(Dataset):
     """
     相邻点对数据集
@@ -301,6 +319,9 @@ class RollingForceHistoryFMDataset(Dataset):
 
         all_p = []
         all_R = []
+        all_pd = []
+        all_Rd = []
+        all_Vd = []
         all_Fe = []
         all_v = []
         all_pc = []
@@ -312,11 +333,18 @@ class RollingForceHistoryFMDataset(Dataset):
             except Exception as e:
                 print(f"[Dataset] Skip bad file: {f}, error: {e}")
                 continue
-
             if "p" not in data:
                 raise ValueError(f"p not found in {f}")
             if "R" not in data:
                 raise ValueError(f"R not found in {f}")
+            if "pd" not in data:
+                raise ValueError(f"dp not found in {f}")
+            if "Rd" not in data:
+                raise ValueError(f"Rd not found in {f}")
+            if "dpd" not in data:
+                raise ValueError(f"dpd not found in {f}")
+            if "dRd" not in data:
+                raise ValueError(f"dRd not found in {f}")
             if "Vd_star" not in data:
                 raise ValueError(f"Vd_star not found in {f}")
             if "Fe" not in data:
@@ -327,6 +355,17 @@ class RollingForceHistoryFMDataset(Dataset):
             p = data["p"].astype(np.float32)
             R = data["R"].astype(np.float32)
             R6d = rotmat_batch_to_rot6d(R)
+            pd = data["pd"].astype(np.float32)
+            Rd = data["Rd"].astype(np.float32)
+            Rd6d = rotmat_batch_to_rot6d(Rd)
+
+            dpd = data["dpd"].astype(np.float32)
+            dRd = data["dRd"].astype(np.float32)
+
+            vd_body = np.einsum("tji,tj->ti", Rd, dpd)
+            wd_body = vee_batch(np.einsum("tji,tjk->tik", Rd, dRd))
+            Vd_body = np.concatenate([vd_body, wd_body], axis=-1)
+
             fe = data["Fe"].astype(np.float32)
             v = data["Vd_star"].astype(np.float32)
             pc = data["point_cloud"].astype(np.float32)
@@ -352,6 +391,9 @@ class RollingForceHistoryFMDataset(Dataset):
             T = len(v)
             all_p.append(p)
             all_R.append(R6d)
+            all_pd.append(pd)
+            all_Rd.append(Rd6d)
+            all_Vd.append(Vd_body)
             all_Fe.append(fe)
             all_v.append(v)
             all_pc.append(pc)
@@ -399,16 +441,17 @@ class RollingForceHistoryFMDataset(Dataset):
                 # 下一步状态，给视觉分支监督
                 # p_next = p[k + 1].astype(np.float32)
                 # R_next = R[k + 1].astype(np.float32)
-                # 未来第10步状态，给视觉分支监督
-                m = 10
-                p_next = p[min(k + m, T - 1)].astype(np.float32)
-                R_next = R[min(k + m, T - 1)].astype(np.float32)
-                delta_pose_target = build_delta_pose_target(p_now, R_now, p_next, R_next)  # [9]
+                
+                # 当前期望位姿，给视觉分支监督
+                m = 0
+                p_d = pd[min(k + m, T - 1)].astype(np.float32)
+                R_d = Rd[min(k + m, T - 1)].astype(np.float32)
+                delta_pose_target = build_delta_pose_target(p_now, R_now, p_d, R_d)  # [9]
                 all_delta_p.append(delta_pose_target[:3][None, :])   # [1,3]
                 all_delta_R.append(delta_pose_target[3:][None, :])   # [1,6]
 
                 v_future = v[k + 1: k + 1 + pred_horizon]
-
+                Vd_body_future = Vd_body[k : k + pred_horizon]
                 self.samples.append({
                     # "p_now_raw": p_now,
                     # "R6d_now_raw": R6d_now,
@@ -418,6 +461,7 @@ class RollingForceHistoryFMDataset(Dataset):
                     "pc_hist_raw": pc_hist,
                     "fe_hist_raw": fe_hist,
                     "v_future_raw": v_future,
+                    "Vd_body_future_raw": Vd_body_future,
                 })
 
         if len(self.samples) == 0:
@@ -445,6 +489,11 @@ class RollingForceHistoryFMDataset(Dataset):
             v_std = all_v_cat.std(axis=0, keepdims=True).astype(np.float32)
             v_std = np.clip(v_std, eps, None)
 
+            all_vd_cat = np.concatenate(all_Vd, axis=0)  # [sum(T), 6]
+            vd_mean = all_vd_cat.mean(axis=0, keepdims=True).astype(np.float32)
+            vd_std = all_vd_cat.std(axis=0, keepdims=True).astype(np.float32)
+            vd_std = np.clip(vd_std, eps, None)
+
             all_delta_p_cat = np.concatenate(all_delta_p, axis=0)   # [num_samples, 3]
             delta_p_mean = all_delta_p_cat.mean(axis=0, keepdims=True).astype(np.float32)
             delta_p_std = all_delta_p_cat.std(axis=0, keepdims=True).astype(np.float32)
@@ -466,6 +515,8 @@ class RollingForceHistoryFMDataset(Dataset):
                 "fe_std": fe_std,
                 "v_mean": v_mean,
                 "v_std": v_std,
+                "vd_mean": vd_mean,
+                "vd_std": vd_std,
                 "delta_p_mean": delta_p_mean,
                 "delta_p_std": delta_p_std,
                 "delta_R_mean": delta_R_mean,
@@ -481,6 +532,8 @@ class RollingForceHistoryFMDataset(Dataset):
                 "fe_std": np.clip(cond_stats["fe_std"].astype(np.float32), eps, None),
                 "v_mean": cond_stats["v_mean"].astype(np.float32),
                 "v_std": np.clip(cond_stats["v_std"].astype(np.float32), eps, None),
+                "vd_mean": cond_stats["vd_mean"].astype(np.float32),
+                "vd_std": np.clip(cond_stats["vd_std"].astype(np.float32), eps, None),
                 "delta_p_mean": cond_stats["delta_p_mean"].astype(np.float32),
                 "delta_p_std": np.clip(cond_stats["delta_p_std"].astype(np.float32), eps, None),
                 "delta_R_mean": cond_stats["delta_R_mean"].astype(np.float32),
@@ -499,6 +552,9 @@ class RollingForceHistoryFMDataset(Dataset):
                 ).astype(np.float32)
                 s["v_future"] = (
                     (s["v_future_raw"] - self.cond_stats["v_mean"]) / self.cond_stats["v_std"]
+                ).astype(np.float32)
+                s["Vd_body_future"] = (
+                    (s["Vd_body_future_raw"] - self.cond_stats["vd_mean"]) / self.cond_stats["vd_std"]
                 ).astype(np.float32)
 
                 pc_raw = s["pc_hist_raw"].astype(np.float32)
@@ -524,6 +580,7 @@ class RollingForceHistoryFMDataset(Dataset):
                 s["R_hist"] = s["R_hist_raw"].astype(np.float32)
                 s["fe_hist"] = s["fe_hist_raw"].astype(np.float32)
                 s["v_future"] = s["v_future_raw"].astype(np.float32)
+                s["Vd_body_future"] = s["Vd_body_future_raw"].astype(np.float32)
                 s["pc_hist"] = s["pc_hist_raw"].astype(np.float32)
                 s["delta_pose_target_norm"] = s["delta_pose_target"].astype(np.float32)
 
@@ -552,6 +609,7 @@ class RollingForceHistoryFMDataset(Dataset):
             torch.from_numpy(s["pc_hist"].astype(np.float32)),  # [H,6]
             torch.from_numpy(s["delta_pose_target_norm"].astype(np.float32)),
             torch.from_numpy(s["v_future"].astype(np.float32)),  # [H,6]
+            torch.from_numpy(s["Vd_body_future"].astype(np.float32)),  # [H,6]
         )
 
     def get_cond_stats(self):

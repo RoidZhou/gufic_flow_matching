@@ -55,7 +55,7 @@ class TrainConfig:
     def __post_init__(self):
         if self.task == "bolt":
             self.pred_horizon = 400
-            self.stride = 2
+            self.stride = 1
     # 混合损失权重
     lambda_vel: float = 1.0
     lambda_fm: float = 0.2

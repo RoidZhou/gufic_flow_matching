@@ -25,7 +25,7 @@ from recorder import BoltTrajectoryRecorder
 class RobotEnv:
     def __init__(self, robot_name = 'indy7', max_time = 20, show_viewer = False, fz = 5, observables = None,
                  fix_camera = False, task = 'regulation', randomized_start = False, inertia_shaping = False,
-                 save_dir = None):
+                 save_dir = None, save_tensorboard=False):
         
         self.robot_name = robot_name
         self.task = task
@@ -42,6 +42,7 @@ class RobotEnv:
         self.fz_mode = "other"
         self.golbal_steps = 0
         self.start_from_random = False
+        self.save_tensorboard = save_tensorboard
         self.writer = SummaryWriter('./gufic/logs')
         self.writer1 = SummaryWriter('./gufic/logs1')
         self.writer2 = SummaryWriter('./gufic/logs2')
@@ -93,7 +94,7 @@ class RobotEnv:
             self.set_robot_to_pose(self.p_init, self.R_init)
         elif self.task == 'bolt':
             # self.p_init = np.array([0.50, 0.0, 0.225])
-            self.p_init = np.array([0.50, 0.0, 0.29])
+            self.p_init = np.array([0.50, 0.0, 0.25])
             Rd_default = np.array([[0, 1, 0],
                                [1, 0, 0],
                                [0, 0, -1]])
@@ -557,6 +558,10 @@ class RobotEnv:
         dpd = self.dpd_t(t).reshape((-1,))
         dRd = self.dRd_t(t)
 
+        self.rec_pd = pd
+        self.rec_Rd = Rd
+        self.rec_dpd = dpd
+        self.rec_dRd = dRd
         ddpd = self.ddpd_t(t).reshape((-1,))
         ddRd = self.ddRd_t(t)
 
@@ -799,18 +804,19 @@ class RobotEnv:
         torque_x = Fe[3]
         torque_y = Fe[4]
         torque_z = Fe[5]
-        self.writer.add_scalars("force_x",
-                                {"force_x": force_x}, self.golbal_steps)
-        self.writer.add_scalars("force_y",
-                                {"force_y": force_y}, self.golbal_steps)
-        self.writer.add_scalars("force_z",
-                                {"force_z": force_z}, self.golbal_steps)
-        self.writer.add_scalars("torque_x",
-                                {"torque_x": torque_x}, self.golbal_steps)
-        self.writer.add_scalars("torque_y",
-                                {"torque_y": torque_y}, self.golbal_steps)
-        self.writer.add_scalars("torque_z",
-                                {"torque_z": torque_z}, self.golbal_steps)   
+        if self.save_tensorboard:
+            self.writer.add_scalars("force_x",
+                                    {"force_x": force_x}, self.golbal_steps)
+            self.writer.add_scalars("force_y",
+                                    {"force_y": force_y}, self.golbal_steps)
+            self.writer.add_scalars("force_z",
+                                    {"force_z": force_z}, self.golbal_steps)
+            self.writer.add_scalars("torque_x",
+                                    {"torque_x": torque_x}, self.golbal_steps)
+            self.writer.add_scalars("torque_y",
+                                    {"torque_y": torque_y}, self.golbal_steps)
+            self.writer.add_scalars("torque_z",
+                                    {"torque_z": torque_z}, self.golbal_steps)   
         # NOTE(JS) Working is version is that to put e_force = - Fe - Fd, with the Fe = -self.robot_state.get_ee_force()
         # Fd should be positive as well
 
@@ -839,6 +845,10 @@ class RobotEnv:
             t=self.iter * self.dt,
             p=p,
             R=R,
+            pd=self.rec_pd,
+            Rd=self.rec_Rd,
+            dpd=self.rec_dpd,
+            dRd=self.rec_dRd,
             Vd_star=np.asarray(Vd_star).reshape(6),
             dVd_star=np.asarray(dVd_star).reshape(6),
             Fe=np.asarray(Fe).reshape(6),
@@ -851,37 +861,39 @@ class RobotEnv:
         eg = self.get_eg(g, gd_t)
 
         # 位置跟踪
-        self.writer1.add_scalars("p_x",
-                {"p_x": p[0]}, self.golbal_steps)
-        self.writer1.add_scalars("p_y",
-                {"p_y": p[1]}, self.golbal_steps)
-        self.writer1.add_scalars("p_z",
-                {"p_z": p[2]}, self.golbal_steps)
-        
-        self.writer2.add_scalars("p_x",
-                {"pd_x": self.pd_t(t)[0]}, self.golbal_steps)
-        self.writer2.add_scalars("p_y",
-                {"pd_y": self.pd_t(t)[1]}, self.golbal_steps)
-        self.writer2.add_scalars("p_z",
-                {"pd_z": self.pd_t(t)[2]}, self.golbal_steps)
+        if self.save_tensorboard:
+            self.writer1.add_scalars("p_x",
+                    {"p_x": p[0]}, self.golbal_steps)
+            self.writer1.add_scalars("p_y",
+                    {"p_y": p[1]}, self.golbal_steps)
+            self.writer1.add_scalars("p_z",
+                    {"p_z": p[2]}, self.golbal_steps)
+            
+            self.writer2.add_scalars("p_x",
+                    {"pd_x": self.pd_t(t)[0]}, self.golbal_steps)
+            self.writer2.add_scalars("p_y",
+                    {"pd_y": self.pd_t(t)[1]}, self.golbal_steps)
+            self.writer2.add_scalars("p_z",
+                    {"pd_z": self.pd_t(t)[2]}, self.golbal_steps)
         
         # 姿态跟踪
         r = RT.from_matrix(R).as_euler('xyz', degrees=True)
         rd = RT.from_matrix(self.Rd_t(t)).as_euler('xyz', degrees=True)
         # r[0] = r[0] % 360 # 将角度限制在 [0, 360], 避免跳变
-        self.writer1.add_scalars("r_x",
-                {"r_x": r[0]}, self.golbal_steps)
-        self.writer1.add_scalars("r_y",
-                {"r_y": r[1]}, self.golbal_steps)
-        self.writer1.add_scalars("r_z",
-                {"r_z": r[2]}, self.golbal_steps)
-        
-        self.writer2.add_scalars("r_x",
-                {"rd_x": rd[0]}, self.golbal_steps)
-        self.writer2.add_scalars("r_y",
-                {"rd_y": rd[1]}, self.golbal_steps)
-        self.writer2.add_scalars("r_z",
-                {"rd_z": rd[2]}, self.golbal_steps)
+        if self.save_tensorboard:
+            self.writer1.add_scalars("r_x",
+                    {"r_x": r[0]}, self.golbal_steps)
+            self.writer1.add_scalars("r_y",
+                    {"r_y": r[1]}, self.golbal_steps)
+            self.writer1.add_scalars("r_z",
+                    {"r_z": r[2]}, self.golbal_steps)
+            
+            self.writer2.add_scalars("r_x",
+                    {"rd_x": rd[0]}, self.golbal_steps)
+            self.writer2.add_scalars("r_y",
+                    {"rd_y": rd[1]}, self.golbal_steps)
+            self.writer2.add_scalars("r_z",
+                    {"rd_z": rd[2]}, self.golbal_steps)
 
         ep = eg[:3,0]
         eR = eg[3:,0]
@@ -978,8 +990,9 @@ class RobotEnv:
         Vd_star_mod = activation_impedance * Vd_star
         dVd_star_mod = activation_impedance * dVd_star
         ev_mod = Vb - Vd_star_mod
-        self.writer.add_scalars("activation_impedance",
-                        {"activation_impedance": activation_impedance}, self.golbal_steps)
+        if self.save_tensorboard:
+            self.writer.add_scalars("activation_impedance",
+                            {"activation_impedance": activation_impedance}, self.golbal_steps)
 
         # calculate next_step gd
         Vd_mod = adjoint_g_ed(np.linalg.inv(g_ed)) @ Vd_star_mod
@@ -1047,7 +1060,7 @@ if __name__ == "__main__":
 
     assert task in ['regulation', 'circle', 'line', 'sphere', 'insertion', "bolt"]
 
-    save_dir = "/media/zhou/Elements SE/VLA/boltnut_demos_vis_random_start"
+    save_dir = "/media/zhou/Elements SE/VLA/boltnut3_demos_vis_random_start"
     if task == 'regulation':
         max_time = 6
     elif task == 'line':
@@ -1061,17 +1074,19 @@ if __name__ == "__main__":
         max_time = 6
         fz = 5
     elif task == 'bolt':
-        max_time = 16
+        max_time = 12
         fz = 5
     else:
         max_time = 6
         fz = 5
 
+    save_tensorboard = False
+
     RE = RobotEnv(robot_name, show_viewer = show_viewer, max_time = max_time, fz = fz, 
                   fix_camera = True, task = task, randomized_start=randomized_start, 
-                  inertia_shaping = inertia_shaping, save_dir=save_dir)
+                  inertia_shaping = inertia_shaping, save_dir=save_dir,save_tensorboard=save_tensorboard)
     
-    for episode in range(120, 175):
+    for episode in range(0, 100):
         RE.reset()
         RE.run()
         success = RE.check_task_success()

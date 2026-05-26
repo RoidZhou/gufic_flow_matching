@@ -422,7 +422,7 @@
                       </body>
                     </body>
 
-                    <body name="eye_in_hand_body" pos="0.00 -0.08 0.05" euler="3.1415 0 0">
+                    <body name="eye_in_hand_body" pos="0.00 0.04 0.15" euler="3.1415 0 0">
                       <geom 
                           name="eye_in_hand_marker"
                           type="box"

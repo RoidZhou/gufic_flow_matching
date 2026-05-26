@@ -1,20 +1,29 @@
-from gufic_env.flow_matching.dataset import rotmat_batch_to_rot6d, uniform_sample_one_frame, get_hand_eye_from_xml, pointcloud_cam_to_world_batch
+from gufic_env.flow_matching.dataset import (
+    rotmat_batch_to_rot6d,
+    uniform_sample_one_frame,
+    get_hand_eye_from_xml,
+    pointcloud_cam_to_world_batch,
+)
 import os
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
 
-from gufic_env.flow_matching.model import VelocityFMMLP, VelocityFMTransformer, VelocityFMCondUnet1D, VisionDeltaPoseNet
+from gufic_env.flow_matching.model import (
+    VelocityFMMLP,
+    VelocityFMTransformer,
+    VelocityFMCondUnet1D,
+    VisionDeltaPoseNet,
+)
 from gufic_env.flow_matching.config import TrainConfig
-from gufic_env.flow_matching.diffusion_model.vision.pointnet import PointNetBackbone
+
+
 # ============================================================
 # Config / checkpoint loading
 # ============================================================
 
 def build_cfg_from_ckpt(ckpt_config: dict):
-    """
-    用 checkpoint 里的配置覆盖 TrainConfig 默认值
-    """
+    """用 checkpoint 里的配置覆盖 TrainConfig 默认值。"""
     cfg = TrainConfig()
     if ckpt_config is not None:
         for k, v in ckpt_config.items():
@@ -37,6 +46,7 @@ def load_model(ckpt_path, device="cuda"):
         model = VelocityFMTransformer(
             x_dim=6,
             cond_dim=cfg.cond_dim,
+            guide_dim=getattr(cfg, "guide_dim", 16),
             time_dim=cfg.time_dim,
             hidden_dim=cfg.hidden_dim,
             num_layers=cfg.num_layers,
@@ -47,7 +57,7 @@ def load_model(ckpt_path, device="cuda"):
             x_dim=6,
             cond_dim=cfg.cond_dim,
             time_dim=cfg.time_dim,
-            use_cond=False
+            use_cond=False,
         ).to(device)
     else:
         model = VelocityFMMLP(
@@ -65,16 +75,20 @@ def load_model(ckpt_path, device="cuda"):
     obs_encoder = VisionDeltaPoseNet(
         state_dim=cfg.state_dim,
         guide_dim=cfg.guide_dim,
-        embed_dim= cfg.embed_dim,
-        input_channels= cfg.input_channels,
-        input_transform= cfg.input_transform,
-        ).to(device)
+        embed_dim=cfg.embed_dim,
+        input_channels=cfg.input_channels,
+        input_transform=cfg.input_transform,
+    ).to(device)
     obs_encoder.load_state_dict(ckpt["obs_encoder"])
     obs_encoder.eval()
 
+    # 兼容两种命名：新版 cond_stats，旧版 stats
     stats = ckpt.get("cond_stats", None)
     if stats is None:
-        raise ValueError("Checkpoint 中没有找到 stats，请先在训练保存时把 v_mean / v_std 一起存进去。")
+        stats = ckpt.get("stats", None)
+
+    if stats is None:
+        raise ValueError("Checkpoint 中没有找到 cond_stats / stats。")
 
     if "v_mean" not in stats or "v_std" not in stats:
         raise ValueError("stats 里必须包含 'v_mean' 和 'v_std'。")
@@ -84,7 +98,6 @@ def load_model(ckpt_path, device="cuda"):
 
 # ============================================================
 # Normalization helpers
-# 只对 v 做归一化 / 反归一化
 # ============================================================
 
 def normalize_data(data, stats, key="v"):
@@ -95,28 +108,194 @@ def denormalize_data(data, stats, key="v"):
     return data * stats[f"{key}_std"] + stats[f"{key}_mean"]
 
 
+def get_velocity_key(stats):
+    """
+    如果当前模型训练目标是 Vd_body_future，则 checkpoint 中应包含 vd_mean/vd_std。
+    否则退回到 v_mean/v_std。
+    """
+    if "vd_mean" in stats and "vd_std" in stats:
+        return "vd"
+    return "v"
+
+
 # ============================================================
 # Demo loading
-# 主对象统一成 Vd_star
 # ============================================================
 
 def load_one_demo(npz_path):
     data = np.load(npz_path)
     demo = {
-        "v": data["Vd_star"].astype(np.float32),      # [T, 6]
-        "p": data["p"].astype(np.float32),        # [T, 3]
-        "R": data["R"].astype(np.float32),        # [T, 3, 3]
-        "fe": data["Fe"].astype(np.float32),      # [T, 6]
-        "pc": data["point_cloud"].astype(np.float32),   # [T,6]
-        "t": data["t"].astype(np.float32),            # [T]
+        "v": data["Vd_star"].astype(np.float32),       # [T, 6]
+        "p": data["p"].astype(np.float32),             # [T, 3]
+        "R": data["R"].astype(np.float32),             # [T, 3, 3]
+        "fe": data["Fe"].astype(np.float32),           # [T, 6]
+        "pc": data["point_cloud"].astype(np.float32),  # [T, P, C]
+        "t": data["t"].astype(np.float32),             # [T]
         "total_time": float(data["total_time"][0]),
     }
+
+    # 真实期望位姿，用于画 VDP-Net 预测的 pd/Rd 对比曲线
+    demo["pd"] = data["pd"].astype(np.float32) if "pd" in data else None
+    demo["Rd"] = data["Rd"].astype(np.float32) if "Rd" in data else None
+
+    # 可选：真实期望轨迹速度，如果你后续想对比 Vd_body
+    if "dpd" in data and "dRd" in data and "Rd" in data:
+        demo["dpd"] = data["dpd"].astype(np.float32)
+        demo["dRd"] = data["dRd"].astype(np.float32)
+    else:
+        demo["dpd"] = None
+        demo["dRd"] = None
+
     return demo
 
 
 # ============================================================
-# Unconditional FM sampling
-# 生成的是速度轨迹样本 v，而不是状态 x
+# Lie / rotation helpers
+# ============================================================
+
+def vee_map(R):
+    v3 = -R[0, 1]
+    v1 = -R[1, 2]
+    v2 = R[0, 2]
+    return np.array([v1, v2, v3], dtype=np.float32).reshape((-1, 1))
+
+
+def hat_map(w):
+    wx, wy, wz = w.reshape(3)
+    return np.array(
+        [
+            [0.0, -wz, wy],
+            [wz, 0.0, -wx],
+            [-wy, wx, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+
+def rot6d_to_rotmat_np(r6d: np.ndarray) -> np.ndarray:
+    """
+    r6d: [6]，格式与 rotmat_to_rot6d_one / rotmat_batch_to_rot6d 一致：
+         [R[:,0], R[:,1]]
+    return: [3,3]
+    """
+    r6d = np.asarray(r6d, dtype=np.float32).reshape(6)
+
+    a1 = r6d[:3]
+    a2 = r6d[3:6]
+
+    b1 = a1 / (np.linalg.norm(a1) + 1e-8)
+    a2_orth = a2 - np.dot(b1, a2) * b1
+    b2 = a2_orth / (np.linalg.norm(a2_orth) + 1e-8)
+    b3 = np.cross(b1, b2)
+
+    R = np.stack([b1, b2, b3], axis=1)
+    return R.astype(np.float32)
+
+
+def rotation_geodesic_error_deg(R_pred, R_gt):
+    """
+    R_pred: [N,3,3]
+    R_gt:   [N,3,3]
+    return: [N], unit: degree
+    """
+    R_err = np.einsum("nij,njk->nik", np.transpose(R_pred, (0, 2, 1)), R_gt)
+    trace = np.trace(R_err, axis1=1, axis2=2)
+    cos_theta = (trace - 1.0) / 2.0
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    theta = np.arccos(cos_theta)
+    return theta * 180.0 / np.pi
+
+
+def recover_pose_from_delta(
+    p_now_raw: np.ndarray,
+    R_now_raw: np.ndarray,
+    delta_pose_pred_norm: np.ndarray,
+    stats: dict,
+):
+    """
+    根据 VDP-Net 输出的归一化局部 delta pose，恢复世界系预测期望位姿。
+
+    Dataset 中 delta_pose_target 的定义是：
+        delta_p_local = R_now.T @ (p_d - p_now)
+        R_rel = R_now.T @ R_d
+
+    因此推理恢复：
+        p_d_pred = p_now + R_now @ delta_p_local
+        R_d_pred = R_now @ R_rel_pred
+    """
+    delta_pose_pred_norm = np.asarray(delta_pose_pred_norm, dtype=np.float32).reshape(9)
+
+    # 1. 反归一化 delta p / delta R6D
+    delta_p_local = denormalize_data(
+        delta_pose_pred_norm[:3][None, :], stats, "delta_p"
+    ).reshape(3).astype(np.float32)
+
+    delta_R6d = denormalize_data(
+        delta_pose_pred_norm[3:9][None, :], stats, "delta_R"
+    ).reshape(6).astype(np.float32)
+
+    # 2. 6D rotation -> relative rotation
+    R_rel_pred = rot6d_to_rotmat_np(delta_R6d)
+
+    # 3. 局部增量恢复成世界系期望位姿
+    p_des_pred = p_now_raw.reshape(3) + R_now_raw.reshape(3, 3) @ delta_p_local
+    R_des_pred = R_now_raw.reshape(3, 3) @ R_rel_pred
+
+    return (
+        p_des_pred.astype(np.float32),
+        R_des_pred.astype(np.float32),
+        delta_p_local.astype(np.float32),
+        R_rel_pred.astype(np.float32),
+    )
+
+
+def vd_body_to_dpd_dRd(Vd_body, Rd):
+    """
+    Vd_body: [6] = [vd_body, wd_body]
+    Rd: [3,3]
+
+    return:
+        dpd: [3]
+        dRd: [3,3]
+    """
+    vd_body = Vd_body[:3].reshape(3)
+    wd_body = Vd_body[3:].reshape(3)
+
+    dpd = Rd @ vd_body
+    dRd = Rd @ hat_map(wd_body)
+
+    return dpd.astype(np.float32), dRd.astype(np.float32)
+
+
+def get_velocity_field(g, pd, Rd, dpd, dRd, zeta_v=50.0, zeta_w=10.0):
+    """
+    根据预测的 pd/Rd 和 Vd_body 转换得到的 dpd/dRd，
+    使用解析几何速度场公式恢复最终 Vd_star。
+    """
+    p = g[:3, 3]
+    R = g[:3, :3]
+
+    Vd_star = np.zeros(6, dtype=np.float32)
+
+    vd_star = (
+        R.T @ dRd @ Rd.T @ (p - pd)
+        + R.T @ dpd
+        - zeta_v * R.T @ (p - pd)
+    )
+
+    wd_star = vee_map(
+        R.T @ dRd @ Rd.T @ R
+        - zeta_w * (Rd.T @ R - R.T @ Rd)
+    ).reshape((-1,))
+
+    Vd_star[:3] = vd_star
+    Vd_star[3:] = wd_star
+
+    return Vd_star.astype(np.float32)
+
+
+# ============================================================
+# FM sampling
 # ============================================================
 
 @torch.no_grad()
@@ -131,100 +310,66 @@ def sample_velocity_trajectory(
     seed=None,
     cfg=None,
     cond=None,
-    cond_pc_np=None
+    cond_pc_np=None,
 ):
     """
-    条件 / 无条件 FM 采样
-
-    无条件:
-      v_t ~ N(0, I)
-      u_pred = model(v_t, t)
-      v_t <- v_t + u_pred * dt
-
-    条件:
-      v_t ~ N(0, I)
-      u_pred = model(v_t, t, fe_cond)
-      v_t <- v_t + u_pred * dt
-
-    这里:
-      - v_t 是当前生成中的“速度轨迹样本”（normalized space）
-      - u_pred 是 FM 的流速度（normalized space）
-      - 最终生成结果是 v_sample_final，而不是 u_final
-
-    Args:
-      traj_len:       轨迹长度 T
-      stats:          {"v_mean": ..., "v_std": ...}
-      steps:          ODE 采样步数
-      return_history: 是否返回采样历史
-      seed:           随机种子，可选
-      cfg:            训练配置，要求含 use_cond / cond_dim
-      cond:           条件输入
-                      - 若使用最近 K 步力序列，可传 [K, 6]
-                      - 或传已经 flatten 后的 [6*K]
-
-    Returns:
-      result = {
-        "v_sample_final":       [T, 6]   # 反归一化后的最终生成速度轨迹
-        "v_sample_final_norm":  [T, 6]   # 归一化空间里的最终轨迹
-        "u_final_norm":         [T, 6]   # 最后一步模型输出（flow velocity）
-        "v_sample_history":     [steps+1, T, 6] or None   # 反归一化后的历史
-        "v_sample_history_norm":[steps+1, T, 6] or None   # 归一化空间里的历史
-        "u_history_norm":       [steps, T, 6] or None
-        "step_t":               [steps+1]
-      }
+    条件 / 无条件 FM 采样。
+    若 stats 中存在 vd_mean/vd_std，则默认生成对象是 Vd_body。
+    否则默认生成对象是 Vd_star。
     """
     if seed is not None:
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    dt = 1.0 / steps
+    flow_dt = 1.0 / steps
+    vel_key = get_velocity_key(stats)
 
-    # 初始噪声：速度轨迹样本（normalized space）
+    # 初始噪声：速度轨迹样本，normalized space
     v_t = torch.randn(1, traj_len, 6, device=device)
 
-    # --------------------------------------------------------
-    # 处理条件：最近 K 步力序列
-    # cond 支持:
-    #   [K, 6]   -> 自动 flatten 成 [1, 6*K]
-    #   [6*K]    -> 自动变成 [1, 6*K]
-    # --------------------------------------------------------
     fe_cond = None
+    guide_feat = None
+    delta_pose_pred_norm = None
+
     use_cond = bool(getattr(cfg, "use_cond", False)) if cfg is not None else False
 
     if use_cond:
         if cond is None:
             raise ValueError("cfg.use_cond=True 时，cond 不能为 None。")
+        if cond_pc_np is None:
+            raise ValueError("cfg.use_cond=True 且使用 obs_encoder 时，cond_pc_np 不能为 None。")
 
-        if isinstance(cond, np.ndarray):
-            cond_np = cond.astype(np.float32)
-        else:
-            cond_np = np.asarray(cond, dtype=np.float32)
+        cond_np = cond.astype(np.float32) if isinstance(cond, np.ndarray) else np.asarray(cond, dtype=np.float32)
 
-        # cond: [K,6] -> [6K]
         if cond_np.ndim == 2:
             cond_np = cond_np.reshape(-1)
-
-        # cond: [6K] -> [1,6K]
         if cond_np.ndim == 1:
             cond_np = cond_np[None, :]
-
-        # 最终要求 [1, cond_dim]
         if cond_np.ndim != 2:
-            raise ValueError(f"cond 期望形状为 [K,6] 或 [6*K]，当前是 {cond_np.shape}")
+            raise ValueError(f"cond 期望形状为 [K,D] 或 [D]，当前是 {cond_np.shape}")
 
-        fe_cond = torch.from_numpy(cond_np).to(device).float()   # [1, cond_dim]
-        # 当前状态 x_now 就是 cond_main 的前 9 维
-        x_now_ = fe_cond[:, :9]
+        fe_cond = torch.from_numpy(cond_np).to(device).float()
 
+        if hasattr(cfg, "cond_dim") and fe_cond.shape[-1] != cfg.cond_dim:
+            raise ValueError(
+                f"cond 维度不匹配: got {fe_cond.shape[-1]}, expected {cfg.cond_dim}"
+            )
+
+        # x_now 是 cond_main 中最后一帧归一化状态 [p_norm, R6d_norm]
         now_left = 9 * (cfg.x_hist_len - 1)
         now_right = 9 * cfg.x_hist_len
-        x_now = fe_cond[:, now_left : now_right]
-        # 可选检查
-        if hasattr(cfg, "cond_dim"):
-            if fe_cond.shape[-1] != cfg.cond_dim:
-                raise ValueError(
-                    f"cond 维度不匹配: got {fe_cond.shape[-1]}, expected {cfg.cond_dim}"
-                )
+        x_now = fe_cond[:, now_left:now_right]
+
+        cond_pc = torch.from_numpy(cond_pc_np).to(device).float()
+
+        # 与训练代码保持一致：如果训练时 pc_hist 是 [B,H,P,C]，这里就保留 [1,H,P,C]
+        # 如果 PointNet 实际要求 [B,P,C]，且 pc_hist_len=1，可以改成 cond_pc = cond_pc[0][None]
+        cond_pc = cond_pc.unsqueeze(0)
+
+        guide_feat, delta_pose_pred = obs_encoder(cond_pc, x_now)
+        delta_pose_pred_norm = (
+            delta_pose_pred.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        )  # [9]
 
     v_sample_history_norm = []
     u_history_norm = []
@@ -233,25 +378,16 @@ def sample_velocity_trajectory(
     if return_history:
         v_sample_history_norm.append(v_t.squeeze(0).detach().cpu().numpy().copy())
         step_t.append(0.0)
-    if use_cond:
-        cond_pc = torch.from_numpy(cond_pc_np).to(device).float()   # [1, cond_dim]
-        cond_pc = cond_pc.unsqueeze(0)   # [B, P, C]
-        guide_feat, delta_pose_pred = obs_encoder(cond_pc, x_now)   # [B,guide_dim], [B,9]
-        # cond = torch.cat([fe_cond, guide_feat], dim=-1)         # [B, cond_dim]
 
     for i in range(steps):
-        # flow time，对整条轨迹共用一个标量
         t_value = torch.full(
             (1, 1, 1),
             i / steps,
             device=v_t.device,
-            dtype=v_t.dtype
+            dtype=v_t.dtype,
         )
 
         if use_cond:
-            # Transformer forward 支持 fe: [B, cond_dim]
-            # 内部会自动扩成 [B, T, cond_dim]
-            # u_pred = model(x_t=v_t, t=t_value, fe=cond)   # [1, T, 6]
             u_pred = model(
                 x_t=v_t,
                 t=t_value,
@@ -259,28 +395,30 @@ def sample_velocity_trajectory(
                 guide=guide_feat,
             )
         else:
-            u_pred = model(x_t=v_t, t=t_value)               # [1, T, 6]
+            u_pred = model(x_t=v_t, t=t_value)
 
         if return_history:
             u_history_norm.append(u_pred.squeeze(0).detach().cpu().numpy().copy())
 
-        # Euler 更新
-        v_t = v_t + u_pred * dt
+        v_t = v_t + u_pred * flow_dt
 
         if return_history:
             v_sample_history_norm.append(v_t.squeeze(0).detach().cpu().numpy().copy())
             step_t.append((i + 1) / steps)
 
-    v_sample_final_norm = v_t.squeeze(0).detach().cpu().numpy().astype(np.float32)   # [T,6]
-    u_final_norm = u_pred.squeeze(0).detach().cpu().numpy().astype(np.float32)        # [T,6]
+    v_sample_final_norm = (
+        v_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    )  # [T,6]
+    u_final_norm = (
+        u_pred.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    )  # [T,6]
 
-    # 只对 v 做反归一化
-    v_sample_final = denormalize_data(v_sample_final_norm, stats, "v").astype(np.float32)
+    v_sample_final = denormalize_data(v_sample_final_norm, stats, vel_key).astype(np.float32)
 
     if return_history:
-        v_sample_history_norm = np.stack(v_sample_history_norm, axis=0).astype(np.float32)  # [steps+1, T, 6]
-        v_sample_history = denormalize_data(v_sample_history_norm, stats, "v").astype(np.float32)
-        u_history_norm = np.stack(u_history_norm, axis=0).astype(np.float32)                 # [steps, T, 6]
+        v_sample_history_norm = np.stack(v_sample_history_norm, axis=0).astype(np.float32)
+        v_sample_history = denormalize_data(v_sample_history_norm, stats, vel_key).astype(np.float32)
+        u_history_norm = np.stack(u_history_norm, axis=0).astype(np.float32)
         step_t = np.array(step_t, dtype=np.float32)
     else:
         v_sample_history_norm = None
@@ -292,23 +430,21 @@ def sample_velocity_trajectory(
         "v_sample_final": v_sample_final,
         "v_sample_final_norm": v_sample_final_norm,
         "u_final_norm": u_final_norm,
+        "delta_pose_pred_norm": delta_pose_pred_norm,
         "v_sample_history": v_sample_history,
         "v_sample_history_norm": v_sample_history_norm,
         "u_history_norm": u_history_norm,
         "step_t": step_t,
+        "vel_key": vel_key,
     }
     return result
 
 
 # ============================================================
 # Visualization helpers
-# 全部围绕 v / Vd_star
 # ============================================================
 
 def plot_generated_velocity_components(v_pred, v_gt=None, save_path=None):
-    """
-    横轴 = trajectory step index
-    """
     step_idx = np.arange(len(v_pred))
     labels = ["vx", "vy", "vz", "wx", "wy", "wz"]
 
@@ -335,11 +471,6 @@ def plot_generated_velocity_components(v_pred, v_gt=None, save_path=None):
 
 
 def plot_generated_velocity_error(v_pred, v_gt, save_path=None):
-    """
-    注意：
-      这只是在“单条生成轨迹 vs 单条 demo 轨迹”上的逐点误差。
-      对无条件 FM，这只是参考，不是最核心指标。
-    """
     if v_gt is None or len(v_gt) != len(v_pred):
         return
 
@@ -362,9 +493,6 @@ def plot_generated_velocity_error(v_pred, v_gt, save_path=None):
 
 
 def plot_velocity_norm_hist(v_pred, v_gt=None, save_path=None):
-    """
-    线速度 / 角速度模长分布
-    """
     pred_lin = np.linalg.norm(v_pred[:, :3], axis=1)
     pred_ang = np.linalg.norm(v_pred[:, 3:6], axis=1)
 
@@ -399,22 +527,13 @@ def plot_velocity_norm_hist(v_pred, v_gt=None, save_path=None):
 
 
 def plot_generated_linear_velocity_scatter_3d(v_pred, v_gt=None, save_path=None):
-    """
-    3D 线速度点云：(vx, vy, vz)
-    """
     fig = plt.figure(figsize=(8, 7))
     ax = fig.add_subplot(111, projection="3d")
 
-    ax.scatter(
-        v_pred[:, 0], v_pred[:, 1], v_pred[:, 2],
-        s=3, alpha=0.7, label="generated"
-    )
+    ax.scatter(v_pred[:, 0], v_pred[:, 1], v_pred[:, 2], s=3, alpha=0.7, label="generated")
 
     if v_gt is not None:
-        ax.scatter(
-            v_gt[:, 0], v_gt[:, 1], v_gt[:, 2],
-            s=2, alpha=0.3, label="teacher"
-        )
+        ax.scatter(v_gt[:, 0], v_gt[:, 1], v_gt[:, 2], s=2, alpha=0.3, label="teacher")
 
     ax.set_xlabel("vx")
     ax.set_ylabel("vy")
@@ -431,20 +550,14 @@ def plot_generated_linear_velocity_scatter_3d(v_pred, v_gt=None, save_path=None)
 
 
 def plot_generation_progress(step_t, v_sample_history, save_path=None):
-    """
-    看整个生成过程中，生成出来的速度轨迹样本模长怎么变化
-    这里用的是“生成样本本身”，不是 u_pred
-    """
     if step_t is None or v_sample_history is None:
         return
 
-    # v_sample_history: [steps+1, T, 6]
-    lin_norm = np.linalg.norm(v_sample_history[:, :, :3], axis=2)   # [steps+1, T]
-    ang_norm = np.linalg.norm(v_sample_history[:, :, 3:6], axis=2)  # [steps+1, T]
+    lin_norm = np.linalg.norm(v_sample_history[:, :, :3], axis=2)
+    ang_norm = np.linalg.norm(v_sample_history[:, :, 3:6], axis=2)
 
     mean_lin = lin_norm.mean(axis=1)
     std_lin = lin_norm.std(axis=1)
-
     mean_ang = ang_norm.mean(axis=1)
     std_ang = ang_norm.std(axis=1)
 
@@ -471,6 +584,85 @@ def plot_generation_progress(step_t, v_sample_history, save_path=None):
         plt.show()
 
 
+def plot_desired_pose_comparison(pd_pred, Rd_pred, pd_gt, Rd_gt, save_dir):
+    """
+    pd_pred: [N,3]
+    Rd_pred: [N,3,3]
+    pd_gt:   [N,3]
+    Rd_gt:   [N,3,3]
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    step_idx = np.arange(len(pd_pred))
+
+    # 1. pd 分量对比
+    labels = ["x", "y", "z"]
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+
+    for i in range(3):
+        axes[i].plot(step_idx, pd_gt[:, i], "--", linewidth=1.5, label=f"pd_gt_{labels[i]}")
+        axes[i].plot(step_idx, pd_pred[:, i], linewidth=1.5, label=f"pd_pred_{labels[i]}")
+        axes[i].set_ylabel(f"p_d {labels[i]}")
+        axes[i].grid(alpha=0.3)
+        axes[i].legend()
+
+    axes[-1].set_xlabel("trajectory step")
+    fig.suptitle("Desired Position Comparison")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "pd_comparison.png"), dpi=180)
+    plt.close()
+
+    # 2. pd 误差范数
+    pd_err = np.linalg.norm(pd_pred - pd_gt, axis=1)
+
+    plt.figure(figsize=(9, 4))
+    plt.plot(step_idx, pd_err, linewidth=1.5)
+    plt.xlabel("trajectory step")
+    plt.ylabel(r"$||\hat p_d - p_d||$")
+    plt.title("Desired Position Error")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "pd_error_norm.png"), dpi=180)
+    plt.close()
+
+    # 3. Rd 测地线误差
+    rot_err_deg = rotation_geodesic_error_deg(Rd_pred, Rd_gt)
+
+    plt.figure(figsize=(9, 4))
+    plt.plot(step_idx, rot_err_deg, linewidth=1.5)
+    plt.xlabel("trajectory step")
+    plt.ylabel("rotation error [deg]")
+    plt.title("Desired Orientation Geodesic Error")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "Rd_geodesic_error_deg.png"), dpi=180)
+    plt.close()
+
+    # 4. Rd 矩阵元素对比
+    fig, axes = plt.subplots(3, 3, figsize=(12, 9), sharex=True)
+    for r in range(3):
+        for c in range(3):
+            ax = axes[r, c]
+            ax.plot(step_idx, Rd_gt[:, r, c], "--", linewidth=1.2, label="gt")
+            ax.plot(step_idx, Rd_pred[:, r, c], linewidth=1.2, label="pred")
+            ax.set_title(f"R[{r},{c}]")
+            ax.grid(alpha=0.3)
+            if r == 0 and c == 0:
+                ax.legend()
+
+    fig.suptitle("Desired Rotation Matrix Components")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "Rd_matrix_components.png"), dpi=180)
+    plt.close()
+
+    print("==== Desired Pose Prediction Error ====")
+    print(f"pd mean error     : {pd_err.mean():.6f}")
+    print(f"pd max error      : {pd_err.max():.6f}")
+    print(f"Rd mean error deg : {rot_err_deg.mean():.6f}")
+    print(f"Rd max error deg  : {rot_err_deg.max():.6f}")
+
+    return {"pd_err": pd_err, "rot_err_deg": rot_err_deg}
+
+
 # ============================================================
 # Main infer entry
 # ============================================================
@@ -479,36 +671,36 @@ def run_direct_field_inference(
     ckpt_path,
     demo_path,
     out_dir="./infer_fm",
-    max_points=10000,
+    max_points=15000,
     steps=100,
     seed=None,
-    robot_model = None,
-    robot_task = None
+    robot_model=None,
+    robot_task=None,
 ):
     os.makedirs(out_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     model, obs_encoder, cfg, ckpt, stats = load_model(ckpt_path, device=device)
-
     demo = load_one_demo(demo_path)
 
-    # ========================================================
-    # 无条件/条件 FM 速度轨迹采样
-    # ========================================================
+    pd_pred_arr = None
+    Rd_pred_arr = None
+    pd_gt_arr = None
+    Rd_gt_arr = None
+
     if cfg.train_mode == "fixed_length":
         v_gt = demo["v"]
-        if cfg.use_cond:
-            cond = demo["fe"]
-        else:
-            cond = None
+        cond = demo["fe"] if getattr(cfg, "use_cond", False) else None
 
         if len(v_gt) > max_points:
             idx = np.linspace(0, len(v_gt) - 1, max_points).astype(int)
             v_gt = v_gt[idx]
+
         traj_len = len(v_gt)
 
         result = sample_velocity_trajectory(
             model=model,
+            obs_encoder=obs_encoder,
             traj_len=traj_len,
             stats=stats,
             device=device,
@@ -519,13 +711,14 @@ def run_direct_field_inference(
             cond=cond,
         )
 
-        v_sample_pred = result["v_sample_final"]          # [T,6]，真正的生成结果（反归一化后）
+        v_sample_pred = result["v_sample_final"]
         v_sample_pred_norm = result["v_sample_final_norm"]
-        u_final_norm = result["u_final_norm"]             # 最后一步 flow velocity（normalized space）
-        v_sample_history = result["v_sample_history"]     # [steps+1, T, 6]（反归一化后）
+        u_final_norm = result["u_final_norm"]
+        v_sample_history = result["v_sample_history"]
         v_sample_history_norm = result["v_sample_history_norm"]
         u_history_norm = result["u_history_norm"]
         step_t = result["step_t"]
+
     elif cfg.train_mode == "rolling_horizon":
         v_sample_final = []
         v_sample_final_norm = []
@@ -535,59 +728,84 @@ def run_direct_field_inference(
         u_history_norm = []
         step_t = []
 
+        pd_pred_list = []
+        Rd_pred_list = []
+        pd_gt_list = []
+        Rd_gt_list = []
+
         traj_len = cfg.pred_horizon
         R_ec, t_ec, _ = get_hand_eye_from_xml(robot_model, robot_task)
 
-        # 滚动 horizon 模式下 demo 轨迹太长了，直接用 max_points 定死生成长度
-        for i in range(len(demo["v"])-1):
-            fe_left = max(0, i-cfg.force_hist_len+1)
+        loop_N = len(demo["v"]) - 1
+        if max_points is not None:
+            loop_N = min(loop_N, max_points)
+
+        for i in range(loop_N):
+            fe_left = max(0, i - cfg.force_hist_len + 1)
             x_left = max(0, i - cfg.x_hist_len + 1)
             pc_left = max(0, i - cfg.pc_hist_len + 1)
 
-            cond_fe = demo["fe"][fe_left : i + 1]      # [K,6]，滚动取最近 K 步力作为条件
-            # 对 fe 做归一化
+            # 1. 历史力
+            cond_fe = demo["fe"][fe_left: i + 1]
             cond_fe = normalize_data(cond_fe, stats, "fe").astype(np.float32)
 
-            p_raw = demo["p"][x_left : i + 1].astype(np.float32)       # [T,3]
-            R_raw = demo["R"][x_left : i + 1].astype(np.float32)       # [T,3,3]
-            R6d = rotmat_batch_to_rot6d(R_raw)                        # [T,6]
-            # 对 p 做归一化
-            p = normalize_data(p_raw, stats, "p").astype(np.float32)
-            # 对 R 做归一化
-            R6d = normalize_data(R6d, stats, "R").astype(np.float32)
-            cond_x = np.concatenate([p, R6d], axis=-1)        # [T,9]
+            # 2. 历史位姿
+            p_raw = demo["p"][x_left: i + 1].astype(np.float32)
+            R_raw = demo["R"][x_left: i + 1].astype(np.float32)
+            R6d = rotmat_batch_to_rot6d(R_raw)
 
+            p_norm = normalize_data(p_raw, stats, "p").astype(np.float32)
+            R6d_norm = normalize_data(R6d, stats, "R").astype(np.float32)
+            cond_x = np.concatenate([p_norm, R6d_norm], axis=-1)
+
+            # 3. 当前/历史点云
             if cfg.use_pc_color:
-                cond_pc = demo["pc"][pc_left : i + 1].astype(np.float32)
+                cond_pc = demo["pc"][pc_left: i + 1].astype(np.float32)
             else:
-                cond_pc = demo["pc"][pc_left : i + 1, :,  :3].astype(np.float32)
+                cond_pc = demo["pc"][pc_left: i + 1, :, :3].astype(np.float32)
+
+            # 4. padding
             if cond_fe.shape[0] < cfg.force_hist_len:
-                # 如果不足 K 步历史，就在前面补零
                 pad_len = cfg.force_hist_len - cond_fe.shape[0]
                 cond_fe = np.pad(cond_fe, ((pad_len, 0), (0, 0)), mode="constant")
+
             if cond_x.shape[0] < cfg.x_hist_len:
-                # 如果整个序列都不足 K 步，就在前面补x
                 pad_len = cfg.x_hist_len - cond_x.shape[0]
                 pad = np.repeat(cond_x[0:1], pad_len, axis=0)
                 cond_x = np.concatenate([pad, cond_x], axis=0)
+
             if cond_pc.shape[0] < cfg.pc_hist_len:
-                # 如果整个序列都不足 K 步，就在前面补pc
                 pad_len = cfg.pc_hist_len - cond_pc.shape[0]
                 pad_pc = np.repeat(cond_pc[0:1], pad_len, axis=0)
                 cond_pc = np.concatenate([pad_pc, cond_pc], axis=0)
 
-            p_now_raw = demo["p"][i : i + 1].astype(np.float32)
-            R_now_raw = demo["R"][i : i + 1].astype(np.float32)
-            pc_world = pointcloud_cam_to_world_batch(cond_pc, p_now_raw, R_now_raw, R_ec, t_ec)
-            pc_ee = np.einsum("tji,tpj->tpi", R_now_raw, pc_world[..., :3] - p_now_raw[:, None, :])  # R^T (x_w - p)
+            # 5. 点云转到当前末端系；保持与原始推理代码一致
+            p_now_raw_1 = demo["p"][i: i + 1].astype(np.float32)
+            R_now_raw_1 = demo["R"][i: i + 1].astype(np.float32)
+
+            pc_world = pointcloud_cam_to_world_batch(
+                cond_pc, p_now_raw_1, R_now_raw_1, R_ec, t_ec
+            )
+            pc_ee = np.einsum(
+                "tji,tpj->tpi",
+                R_now_raw_1,
+                pc_world[..., :3] - p_now_raw_1[:, None, :],
+            )
             pc_ee = pc_ee / 0.1
+
             cond_pc = np.stack(
                 [uniform_sample_one_frame(pc_t, 2048, use_xyz_only=True) for pc_t in pc_ee],
-                axis=0
+                axis=0,
             ).astype(np.float32)
+
+            # 注意： Dataset 训练时点云缩放了两次，这里保持一致；
+            # 如果修正了 Dataset 的重复缩放，这里也要同步去掉下面这一行。
             cond_pc = (cond_pc / 0.1).astype(np.float32)
 
-            cond = np.concatenate([cond_x.reshape(1, -1), cond_fe.reshape(1, -1)], axis=-1)
+            # 6. 条件拼接
+            cond = np.concatenate(
+                [cond_x.reshape(1, -1), cond_fe.reshape(1, -1)], axis=-1
+            )
 
             result = sample_velocity_trajectory(
                 model=model,
@@ -602,16 +820,56 @@ def run_direct_field_inference(
                 cond=cond,
                 cond_pc_np=cond_pc,
             )
-            
-            v_sample_final.append(result["v_sample_final"][0:cfg.stride,:])
-            v_sample_final_norm.append(result["v_sample_final_norm"][0:cfg.stride,:])
-            u_final_norm.append(result["u_final_norm"][0:cfg.stride,:])
-            v_sample_history.append(result["v_sample_history"][0:cfg.stride,:])
-            v_sample_history_norm.append(result["v_sample_history_norm"][0:cfg.stride,:])
-            u_history_norm.append(result["u_history_norm"][0:cfg.stride,:])
-            step_t.append(result["step_t"][0:cfg.stride])
-        
-        v_sample_pred = np.stack(v_sample_final, axis=0).astype(np.float32) 
+
+            # 7. VDP-Net 预测 delta pose -> 恢复预测期望位姿 pd/Rd
+            delta_pose_pred_norm = result["delta_pose_pred_norm"]
+            p_now_raw = demo["p"][i].astype(np.float32)
+            R_now_raw = demo["R"][i].astype(np.float32)
+
+            p_des_pred, R_des_pred, delta_p_local, R_rel_pred = recover_pose_from_delta(
+                p_now_raw=p_now_raw,
+                R_now_raw=R_now_raw,
+                delta_pose_pred_norm=delta_pose_pred_norm,
+                stats=stats,
+            )
+
+            pd_pred_list.append(p_des_pred.astype(np.float32))
+            Rd_pred_list.append(R_des_pred.astype(np.float32))
+
+            if demo["pd"] is not None and demo["Rd"] is not None:
+                # 你的 Dataset 当前 m=0，因此这里对齐 i
+                pd_gt_list.append(demo["pd"][i].astype(np.float32))
+                Rd_gt_list.append(demo["Rd"][i].astype(np.float32))
+
+            # 8. FM 生成 Vd_body，并结合预测 pd/Rd 解析构造 Vd_star_pred
+            Vd_body_pred = result["v_sample_final"]  # [H,6]，若 stats 有 vd_mean/vd_std，则为 Vd_body
+            Vd_body_now = Vd_body_pred[0]
+
+            pd = p_des_pred
+            Rd = R_des_pred
+            dpd, dRd = vd_body_to_dpd_dRd(Vd_body_now, Rd)
+
+            g_now = np.eye(4, dtype=np.float32)
+            g_now[:3, :3] = R_now_raw
+            g_now[:3, 3] = p_now_raw
+
+            Vd_star_pred = get_velocity_field(
+                g=g_now,
+                pd=pd,
+                Rd=Rd,
+                dpd=dpd,
+                dRd=dRd,
+            )
+
+            v_sample_final.append(Vd_star_pred)
+            v_sample_final_norm.append(result["v_sample_final_norm"][0])
+            u_final_norm.append(result["u_final_norm"][0])
+            v_sample_history.append(result["v_sample_history"][:, 0, :])
+            v_sample_history_norm.append(result["v_sample_history_norm"][:, 0, :])
+            u_history_norm.append(result["u_history_norm"][:, 0, :])
+            step_t.append(result["step_t"])
+
+        v_sample_pred = np.stack(v_sample_final, axis=0).astype(np.float32)
         v_sample_pred_norm = np.stack(v_sample_final_norm, axis=0).astype(np.float32)
         u_final_norm = np.stack(u_final_norm, axis=0).astype(np.float32)
         v_sample_history = np.stack(v_sample_history, axis=0).astype(np.float32)
@@ -619,24 +877,42 @@ def run_direct_field_inference(
         u_history_norm = np.stack(u_history_norm, axis=0).astype(np.float32)
         step_t = np.stack(step_t, axis=0).astype(np.float32)
 
-        v_sample_pred = v_sample_pred[:, 0, :]
-        v_sample_pred_norm = v_sample_pred_norm[:, 0, :]
-        u_final_norm = u_final_norm[:, 0, :]
-        v_sample_history = v_sample_history[:, 0, :]
-        v_sample_history_norm = v_sample_history_norm[:, 0, :]
-        u_history_norm = u_history_norm[:, 0, :]
-        step_t = step_t[:, 0]
-        v_gt = demo["v"][1:1+len(v_sample_pred)]
+        # 与当前 i 对齐，Vd_star_pred 是在每个 i 时刻用当前 g_now/pd/Rd 构造的
+        v_gt = demo["v"][:len(v_sample_pred)]
+
+        # 9. pd/Rd 预测对比可视化
+        if len(pd_pred_list) > 0 and len(pd_gt_list) == len(pd_pred_list):
+            pd_pred_arr = np.stack(pd_pred_list, axis=0).astype(np.float32)
+            Rd_pred_arr = np.stack(Rd_pred_list, axis=0).astype(np.float32)
+            pd_gt_arr = np.stack(pd_gt_list, axis=0).astype(np.float32)
+            Rd_gt_arr = np.stack(Rd_gt_list, axis=0).astype(np.float32)
+
+            pose_err = plot_desired_pose_comparison(
+                pd_pred=pd_pred_arr,
+                Rd_pred=Rd_pred_arr,
+                pd_gt=pd_gt_arr,
+                Rd_gt=Rd_gt_arr,
+                save_dir=out_dir,
+            )
+
+            np.savez_compressed(
+                os.path.join(out_dir, "desired_pose_prediction_comparison.npz"),
+                pd_pred=pd_pred_arr,
+                Rd_pred=Rd_pred_arr,
+                pd_gt=pd_gt_arr,
+                Rd_gt=Rd_gt_arr,
+                pd_err=pose_err["pd_err"],
+                rot_err_deg=pose_err["rot_err_deg"],
+            )
+        else:
+            print("[Warning] No valid pd/Rd ground truth found for desired pose comparison.")
 
     else:
         raise ValueError(f"Unknown train_mode: {cfg.train_mode}")
 
-
-
-    print("==== Unconditional FM Velocity Generation ====")
+    print("==== FM Velocity Generation ====")
     print(f"generated traj len : {len(v_sample_pred)}")
 
-    # 注意：这是单条生成轨迹 vs 单条 demo 的参考误差
     if v_gt is not None and len(v_gt) == len(v_sample_pred):
         mse = np.mean((v_sample_pred - v_gt) ** 2)
         mae = np.mean(np.abs(v_sample_pred - v_gt))
@@ -657,6 +933,10 @@ def run_direct_field_inference(
         step_t=step_t,
         v_mean=stats["v_mean"],
         v_std=stats["v_std"],
+        pd_pred=pd_pred_arr if pd_pred_arr is not None else np.array([]),
+        Rd_pred=Rd_pred_arr if Rd_pred_arr is not None else np.array([]),
+        pd_gt=pd_gt_arr if pd_gt_arr is not None else np.array([]),
+        Rd_gt=Rd_gt_arr if Rd_gt_arr is not None else np.array([]),
     )
 
     # --------------------------------------------------------
@@ -687,11 +967,12 @@ def run_direct_field_inference(
         save_path=os.path.join(out_dir, "generated_linear_velocity_scatter_3d.png"),
     )
 
-    plot_generation_progress(
-        step_t,
-        v_sample_history,
-        save_path=os.path.join(out_dir, "generation_progress.png"),
-    )
+    # 可选：生成过程可视化
+    # plot_generation_progress(
+    #     step_t,
+    #     v_sample_history,
+    #     save_path=os.path.join(out_dir, "generation_progress.png"),
+    # )
 
     print(f"Saved to: {out_dir}")
     return {
@@ -703,34 +984,44 @@ def run_direct_field_inference(
         "v_sample_history_norm": v_sample_history_norm,
         "u_history_norm": u_history_norm,
         "step_t": step_t,
+        "pd_pred": pd_pred_arr,
+        "Rd_pred": Rd_pred_arr,
+        "pd_gt": pd_gt_arr,
+        "Rd_gt": Rd_gt_arr,
     }
 
 
 if __name__ == "__main__":
     # type = "fixed_start"
     type = "random_start"
-    robot_name = 'indy7'
-    robot_task = 'bolt'
-    if robot_task == 'sphere':
-        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best19.pt"
-        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo/bolt_demo_0098.npz"
-        out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_vis_pRFe_{type}"
-    elif robot_task == 'insertion':
-        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_insertion_vis_pRFe_{type}/cfm_transformer_{type}_best1.pt"
-        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/insertion_vis_demo/bolt_demo_0171.npz"
-        out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_insertion_vis_pRFe_{type}"
-    elif robot_task == 'bolt':
-        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_boltnut_vis_pRFe_{type}/cfm_transformer_{type}_best2.pt"
-        demo_path="/home/zhou/autolab/GUFIC_mujoco-main/boltnut_vis_demo/bolt_demo_0099.npz"
-        out_dir=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_boltnut_vis_pRFe_{type}"
+    robot_name = "indy7"
+    robot_task = "bolt"
+
+    if robot_task == "sphere":
+        ckpt_path = f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_vis_pRFe_{type}/cfm_transformer_vis2pose_{type}_best19.pt"
+        demo_path = "/home/zhou/autolab/GUFIC_mujoco-main/bolt_vis_demo/bolt_demo_0098.npz"
+        out_dir = f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_vis_pRFe_{type}"
+
+    elif robot_task == "insertion":
+        ckpt_path = f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_insertion_vis_pRFe_{type}/cfm_transformer_{type}_best1.pt"
+        demo_path = "/home/zhou/autolab/GUFIC_mujoco-main/insertion_vis_demo/bolt_demo_0171.npz"
+        out_dir = f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_insertion_vis_pRFe_{type}"
+
+    elif robot_task == "bolt":
+        ckpt_path = f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_boltnut_vis_pRFe_{type}/cfm_transformer_{type}_best14.pt"
+        demo_path = "/home/zhou/autolab/GUFIC_mujoco-main/boltnut3_vis_demo/bolt_demo_0000.npz"
+        out_dir = f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_boltnut_vis_pRFe_{type}"
+
+    else:
+        raise ValueError(f"Unknown robot_task: {robot_task}")
 
     run_direct_field_inference(
         ckpt_path=ckpt_path,
         demo_path=demo_path,
         out_dir=out_dir,
-        max_points=10000,
+        max_points=15000,
         steps=10,
         seed=42,
-        robot_model = robot_name,
-        robot_task = robot_task
+        robot_model=robot_name,
+        robot_task=robot_task,
     )

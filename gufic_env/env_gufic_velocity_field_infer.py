@@ -29,7 +29,7 @@ from tensorboardX import SummaryWriter
 from gufic_env.utils.robot_state import RobotState
 from gufic_env.utils.mujoco import set_state, set_body_pose_rotm
 from gufic_env.utils.misc_func import *
-from gufic_env.flow_matching.infer_fm import load_one_demo 
+from gufic_env.flow_matching.infer_fm import load_one_demo, get_velocity_field, vd_body_to_dpd_dRd, recover_pose_from_delta 
 # ============================================================
 # Optional recorder for collecting demos
 # ============================================================
@@ -127,6 +127,7 @@ class RobotEnv:
         seed=None,
         save_tensorboard=False,
         test_offline_cond=False,
+        visualize_delta_pose=True,
     ):
         self.robot_name = robot_name
         self.task = task
@@ -135,6 +136,9 @@ class RobotEnv:
         self.policy = model
         self.save_tensorboard = save_tensorboard
         self.test_offline_cond = test_offline_cond
+        self.visualize_delta_pose = visualize_delta_pose
+        self.delta_pose_pred_world = None
+        self.delta_pose_pred_local = None
 
         if observables is not None:
             self.observables = observables
@@ -197,7 +201,7 @@ class RobotEnv:
             self.set_robot_to_pose(self.p_init, self.R_init)
         elif self.task == 'bolt':
             # self.p_init = np.array([0.50, 0.0, 0.225])
-            self.p_init = np.array([0.50, 0.0, 0.29])
+            self.p_init = np.array([0.50, 0.0, 0.25])
             Rd_default = np.array([[0, 1, 0],
                                [1, 0, 0],
                                [0, 0, -1]])
@@ -307,12 +311,13 @@ class RobotEnv:
             self.pc_hist_len = train_cfg["pc_hist_len"]
             self.pred_horizon = train_cfg["pred_horizon"]
             # self.steps = train_cfg.steps
-            self.steps =10
+            self.steps = train_cfg.get("infer_steps", 10)
             self.fe_queue = deque(maxlen=self.force_hist_len)
 
             self.velocity_model = VelocityFMTransformer(
                 x_dim=6,
                 cond_dim=train_cfg["cond_dim"],
+                guide_dim=train_cfg["guide_dim"],
                 time_dim=train_cfg["time_dim"],
                 hidden_dim=train_cfg["hidden_dim"],
                 num_layers=train_cfg["num_layers"],
@@ -378,6 +383,66 @@ class RobotEnv:
         euler = RT.from_matrix(R).as_euler("xyz", degrees=False).astype(np.float32)
         x_t = np.concatenate([np.asarray(p, dtype=np.float32).reshape(3), euler], axis=0)
         return x_t
+
+    def _update_delta_pose_marker(self, delta_pose_pred, p_raw, R_raw):
+        """
+        Visualize VisionDeltaPoseNet's predicted local delta position.
+        Green sphere: predicted future EE position.
+        Cyan capsule: direction from current EE position to the predicted point.
+        """
+        if (
+            not self.visualize_delta_pose
+            or self.viewer is None
+            or getattr(self, "stats", None) is None
+            or "delta_p_mean" not in self.stats
+            or "delta_p_std" not in self.stats
+        ):
+            return
+
+        delta_pose_norm = delta_pose_pred.detach().cpu().numpy().reshape(-1).astype(np.float32)
+
+        p_now = np.asarray(p_raw, dtype=np.float32).reshape(3)
+        R_now = np.asarray(R_raw, dtype=np.float32).reshape(3, 3)
+
+        p_pred, R_pred, delta_p_local, R_rel_pred = recover_pose_from_delta(
+            p_now_raw=p_now,
+            R_now_raw=R_now,
+            delta_pose_pred_norm=delta_pose_norm,
+            stats=self.stats,
+        )
+
+        delta_p_local = np.asarray(delta_p_local, dtype=np.float32).reshape(3)
+
+        self.delta_pose_pred_local = delta_p_local
+        self.delta_pose_pred_world = p_pred.astype(np.float32)
+
+        with self.viewer.lock():
+            scene = self.viewer.user_scn
+            scene.ngeom = 0
+
+            if scene.ngeom < scene.maxgeom:
+                geom = scene.geoms[scene.ngeom]
+                scene.ngeom += 1
+                mujoco.mjv_initGeom(
+                    geom,
+                    mujoco.mjtGeom.mjGEOM_SPHERE,
+                    np.array([0.005, 0.0, 0.0], dtype=np.float64),
+                    p_pred.astype(np.float64),
+                    np.eye(3, dtype=np.float64).reshape(-1),
+                    np.array([0.1, 1.0, 0.2, 0.9], dtype=np.float32),
+                )
+
+            if np.linalg.norm(p_pred - p_now) > 1e-6 and scene.ngeom < scene.maxgeom:
+                geom = scene.geoms[scene.ngeom]
+                scene.ngeom += 1
+                mujoco.mjv_connector(
+                    geom,
+                    mujoco.mjtGeom.mjGEOM_CAPSULE,
+                    0.004,
+                    p_now.astype(np.float64),
+                    p_pred.astype(np.float64),
+                )
+                geom.rgba[:] = np.array([0.0, 0.8, 1.0, 0.8], dtype=np.float32)
 
     @torch.no_grad()
     def get_learned_velocity_field(self, p, R, t, Fe, point_cloud):
@@ -489,6 +554,12 @@ class RobotEnv:
                 # pc_feat = self.obs_encoder(cond_pc)   # [1, embed_dim]
                 # cond = torch.cat([cond, pc_feat], dim=-1)  # [1, cond_dim]
                 guide_feat, delta_pose_pred = self.obs_encoder(cond_pc, x_now)   # [B,guide_dim], [B,9]
+
+                delta_pose_pred_norm = (
+                    delta_pose_pred.squeeze(0).detach().cpu().numpy().astype(np.float32)
+                )  # [9]
+                
+                self._update_delta_pose_marker(delta_pose_pred, p_raw, R_raw)
                 # cond = torch.cat([cond, guide_feat], dim=-1)         # [B, cond_dim]
 
                 for i in range(self.steps):
@@ -512,9 +583,34 @@ class RobotEnv:
                     v_t = v_t + u_pred * dt
             
                 v_sample = v_t.squeeze(0).detach().cpu().numpy().astype(np.float32)   # [T,6]
-                Vd_star_horizon = denormalize_data(v_sample, self.stats, "v").astype(np.float32)
-                Vd_star = Vd_star_horizon[0]  # 取第一步的速度作为当前时刻的输出
+                Vd_star_horizon = denormalize_data(v_sample, self.stats, "vd").astype(np.float32)
+                Vd_body_now = Vd_star_horizon[0]  # 取第一步的速度作为当前时刻的输出
                 # self.pred_vt = v_sample.copy()
+                p_des_pred, R_des_pred, delta_p_local, R_rel_pred = recover_pose_from_delta(
+                    p_now_raw=p_raw,
+                    R_now_raw=R_raw,
+                    delta_pose_pred_norm=delta_pose_pred_norm,
+                    stats=self.stats,
+                )
+
+                pd = p_des_pred
+                Rd = R_des_pred
+                dpd, dRd = vd_body_to_dpd_dRd(Vd_body_now, Rd)
+
+                g_now = np.eye(4, dtype=np.float32)
+                g_now[:3, :3] = R_raw.reshape(3, 3)
+                g_now[:3, 3] = p_raw.reshape(3)
+
+                Vd_star_pred = get_velocity_field(
+                    g=g_now,
+                    pd=pd,
+                    Rd=Rd,
+                    dpd=dpd,
+                    dRd=dRd,
+                    zeta_v=self.zeta_v,
+                    zeta_w=self.zeta_w,
+                )
+                Vd_star = Vd_star_pred
 
                 if self.iter == 0:
                     dVd_star = np.zeros((6,), dtype=np.float32)
@@ -1142,6 +1238,10 @@ class RobotEnv:
         else:
             Vd_star, dVd_star = self.get_velocity_field(g, Vb.reshape((-1,)), t=current_t)
 
+        contact = abs(float(Fe[2])) > 2.0
+        if contact:
+            dVd_star[:] = 0.0
+
         # optional recording of actual desired field used by controller
         if self.record_demos and self.demo_recorder is not None:
             self.demo_recorder.add(
@@ -1260,6 +1360,9 @@ class RobotEnv:
         self.T_f = 0.5 * self.x_tf**2
 
         activation_force = gamma_f + alpha_f * (1 - gamma_f)
+        if self.save_tensorboard:
+            self.writer.add_scalars("activation_force", {"activation_force": activation_force}, self.golbal_steps)
+            self.writer.add_scalars("T_f", {"T_f": self.T_f}, self.golbal_steps)
         F_f_mod = activation_force * F_f
 
         inner_product_i = (Vd_star.T @ (F_f_mod + Fe)).reshape((-1,))[0]
@@ -1281,6 +1384,7 @@ class RobotEnv:
         ev_mod = Vb - Vd_star_mod
         if self.save_tensorboard:
             self.writer.add_scalars("activation_impedance", {"activation_impedance": activation_impedance}, self.golbal_steps)
+            self.writer.add_scalars("T_i", {"T_i": self.T_i}, self.golbal_steps)
 
         Vd_mod = adjoint_g_ed(np.linalg.inv(g_ed)) @ Vd_star_mod
         Vd_mod_hat = np.zeros((4, 4))
@@ -1368,8 +1472,8 @@ if __name__ == "__main__":
         ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_insertion_vis_pRFe_{type}/cfm_transformer_{type}_best3.pt"
     elif task == 'bolt':
         max_time = 16
-        fz=10
-        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_boltnut_vis_pRFe_{type}/cfm_transformer_{type}_best4.pt"
+        fz=2
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_boltnut_vis_pRFe_{type}/cfm_transformer_{type}_best14.pt"
 
     save_tensorboard = True
 
@@ -1393,8 +1497,9 @@ if __name__ == "__main__":
         record_demos=False,
         demo_save_dir="./bolt_demos_fm_runtime",
         seed=42,
-        save_tensorboard=True,
-        test_offline_cond=False
+        save_tensorboard=save_tensorboard,
+        test_offline_cond=False,
+        visualize_delta_pose=True
     )
 
     RE.run()

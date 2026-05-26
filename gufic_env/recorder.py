@@ -14,6 +14,10 @@ class BoltTrajectoryRecorder:
             "t": [],
             "p": [],
             "R": [],
+            "pd": [],
+            "Rd": [],
+            "dpd": [],
+            "dRd": [],
             "euler": [],
             "Vd_star": [],
             "dVd_star": [],
@@ -21,12 +25,16 @@ class BoltTrajectoryRecorder:
             "point_cloud": [],
         }
 
-    def add(self, t, p, R, Vd_star, dVd_star, Fe=None, point_cloud=None):
+    def add(self, t, p, R, pd, Rd, dpd, dRd, Vd_star, dVd_star, Fe=None, point_cloud=None):
         from scipy.spatial.transform import Rotation as RT
         import numpy as np
 
         p = np.asarray(p).reshape(3)
+        pd = np.asarray(pd).reshape(3)
+        dpd = np.asarray(dpd).reshape(3)
         R = np.asarray(R).reshape(3, 3)
+        Rd = np.asarray(Rd).reshape(3, 3)
+        dRd = np.asarray(dRd).reshape(3, 3)
         Vd_star = np.asarray(Vd_star).reshape(6)
         dVd_star = np.asarray(dVd_star).reshape(6)
 
@@ -34,7 +42,11 @@ class BoltTrajectoryRecorder:
 
         self.records["t"].append(float(t))
         self.records["p"].append(p.astype(np.float32))
+        self.records["pd"].append(pd.astype(np.float32))
+        self.records["dpd"].append(dpd.astype(np.float32))
         self.records["R"].append(R.astype(np.float32))
+        self.records["Rd"].append(Rd.astype(np.float32))
+        self.records["dRd"].append(dRd.astype(np.float32))
         self.records["euler"].append(euler.astype(np.float32))
         self.records["Vd_star"].append(Vd_star.astype(np.float32))
         self.records["dVd_star"].append(dVd_star.astype(np.float32))
