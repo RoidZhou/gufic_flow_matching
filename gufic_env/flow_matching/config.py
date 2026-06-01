@@ -19,6 +19,7 @@ class TrainConfig:
     lr: float = 1e-4
     weight_decay: float = 1e-5
     epochs: int = 30
+    separation_vp: bool = True
 
     add_state_noise: bool = True
     pos_noise_std: float = 0.001
@@ -55,7 +56,7 @@ class TrainConfig:
     def __post_init__(self):
         if self.task == "bolt":
             self.pred_horizon = 400
-            self.stride = 1
+            self.stride = 2
     # 混合损失权重
     lambda_vel: float = 1.0
     lambda_fm: float = 0.2

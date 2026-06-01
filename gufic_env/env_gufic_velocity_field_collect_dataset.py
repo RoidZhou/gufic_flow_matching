@@ -1080,13 +1080,13 @@ if __name__ == "__main__":
         max_time = 6
         fz = 5
 
-    save_tensorboard = False
+    save_tensorboard = True
 
     RE = RobotEnv(robot_name, show_viewer = show_viewer, max_time = max_time, fz = fz, 
                   fix_camera = True, task = task, randomized_start=randomized_start, 
                   inertia_shaping = inertia_shaping, save_dir=save_dir,save_tensorboard=save_tensorboard)
     
-    for episode in range(0, 100):
+    for episode in range(350, 400):
         RE.reset()
         RE.run()
         success = RE.check_task_success()

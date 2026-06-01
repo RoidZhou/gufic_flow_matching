@@ -14,6 +14,7 @@ from gufic_env.flow_matching.model import (
     VelocityFMTransformer,
     VelocityFMCondUnet1D,
     VisionDeltaPoseNet,
+    VisionDeltaPoseNetV2,
 )
 from gufic_env.flow_matching.config import TrainConfig
 
@@ -90,8 +91,6 @@ def load_model(ckpt_path, device="cuda"):
     if stats is None:
         raise ValueError("Checkpoint 中没有找到 cond_stats / stats。")
 
-    if "v_mean" not in stats or "v_std" not in stats:
-        raise ValueError("stats 里必须包含 'v_mean' 和 'v_std'。")
 
     return model, obs_encoder, cfg, ckpt, stats
 
@@ -311,6 +310,7 @@ def sample_velocity_trajectory(
     cfg=None,
     cond=None,
     cond_pc_np=None,
+    vel_key="v",
 ):
     """
     条件 / 无条件 FM 采样。
@@ -322,7 +322,6 @@ def sample_velocity_trajectory(
         torch.cuda.manual_seed_all(seed)
 
     flow_dt = 1.0 / steps
-    vel_key = get_velocity_key(stats)
 
     # 初始噪声：速度轨迹样本，normalized space
     v_t = torch.randn(1, traj_len, 6, device=device)
@@ -367,6 +366,11 @@ def sample_velocity_trajectory(
         cond_pc = cond_pc.unsqueeze(0)
 
         guide_feat, delta_pose_pred = obs_encoder(cond_pc, x_now)
+        # guide_feat, delta_pose_pred = obs_encoder(
+        #                                 cond_pc,
+        #                                 x_now,
+        #                                 cond_hist=fe_cond,
+        #                             )
         delta_pose_pred_norm = (
             delta_pose_pred.squeeze(0).detach().cpu().numpy().astype(np.float32)
         )  # [9]
@@ -676,6 +680,7 @@ def run_direct_field_inference(
     seed=None,
     robot_model=None,
     robot_task=None,
+    separation_vp=True,
 ):
     os.makedirs(out_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -687,6 +692,10 @@ def run_direct_field_inference(
     Rd_pred_arr = None
     pd_gt_arr = None
     Rd_gt_arr = None
+    if separation_vp:
+        vel_key="vd"
+    else:
+        vel_key="v"
 
     if cfg.train_mode == "fixed_length":
         v_gt = demo["v"]
@@ -819,49 +828,53 @@ def run_direct_field_inference(
                 cfg=cfg,
                 cond=cond,
                 cond_pc_np=cond_pc,
+                vel_key=vel_key
             )
+            if separation_vp:
+                # 7. VDP-Net 预测 delta pose -> 恢复预测期望位姿 pd/Rd
+                delta_pose_pred_norm = result["delta_pose_pred_norm"]
+                p_now_raw = demo["p"][i].astype(np.float32)
+                R_now_raw = demo["R"][i].astype(np.float32)
 
-            # 7. VDP-Net 预测 delta pose -> 恢复预测期望位姿 pd/Rd
-            delta_pose_pred_norm = result["delta_pose_pred_norm"]
-            p_now_raw = demo["p"][i].astype(np.float32)
-            R_now_raw = demo["R"][i].astype(np.float32)
+                p_des_pred, R_des_pred, delta_p_local, R_rel_pred = recover_pose_from_delta(
+                    p_now_raw=p_now_raw,
+                    R_now_raw=R_now_raw,
+                    delta_pose_pred_norm=delta_pose_pred_norm,
+                    stats=stats,
+                )
 
-            p_des_pred, R_des_pred, delta_p_local, R_rel_pred = recover_pose_from_delta(
-                p_now_raw=p_now_raw,
-                R_now_raw=R_now_raw,
-                delta_pose_pred_norm=delta_pose_pred_norm,
-                stats=stats,
-            )
+                pd_pred_list.append(p_des_pred.astype(np.float32))
+                Rd_pred_list.append(R_des_pred.astype(np.float32))
 
-            pd_pred_list.append(p_des_pred.astype(np.float32))
-            Rd_pred_list.append(R_des_pred.astype(np.float32))
+                if demo["pd"] is not None and demo["Rd"] is not None:
+                    # 你的 Dataset 当前 m=0，因此这里对齐 i
+                    pd_gt_list.append(demo["pd"][i].astype(np.float32))
+                    Rd_gt_list.append(demo["Rd"][i].astype(np.float32))
 
-            if demo["pd"] is not None and demo["Rd"] is not None:
-                # 你的 Dataset 当前 m=0，因此这里对齐 i
-                pd_gt_list.append(demo["pd"][i].astype(np.float32))
-                Rd_gt_list.append(demo["Rd"][i].astype(np.float32))
+                # 8. FM 生成 Vd_body，并结合预测 pd/Rd 解析构造 Vd_star_pred
+                Vd_body_pred = result["v_sample_final"]  # [H,6]，若 stats 有 vd_mean/vd_std，则为 Vd_body
+                Vd_body_now = Vd_body_pred[0]
 
-            # 8. FM 生成 Vd_body，并结合预测 pd/Rd 解析构造 Vd_star_pred
-            Vd_body_pred = result["v_sample_final"]  # [H,6]，若 stats 有 vd_mean/vd_std，则为 Vd_body
-            Vd_body_now = Vd_body_pred[0]
+                pd = p_des_pred
+                Rd = R_des_pred
+                dpd, dRd = vd_body_to_dpd_dRd(Vd_body_now, Rd)
 
-            pd = p_des_pred
-            Rd = R_des_pred
-            dpd, dRd = vd_body_to_dpd_dRd(Vd_body_now, Rd)
+                g_now = np.eye(4, dtype=np.float32)
+                g_now[:3, :3] = R_now_raw
+                g_now[:3, 3] = p_now_raw
 
-            g_now = np.eye(4, dtype=np.float32)
-            g_now[:3, :3] = R_now_raw
-            g_now[:3, 3] = p_now_raw
-
-            Vd_star_pred = get_velocity_field(
-                g=g_now,
-                pd=pd,
-                Rd=Rd,
-                dpd=dpd,
-                dRd=dRd,
-            )
-
-            v_sample_final.append(Vd_star_pred)
+                Vd_star_pred = get_velocity_field(
+                    g=g_now,
+                    pd=pd,
+                    Rd=Rd,
+                    dpd=dpd,
+                    dRd=dRd,
+                )
+                v_sample_final.append(Vd_star_pred)
+            else:
+                # Direct Vd_star mode: the sampled trajectory is [H, 6], but
+                # rolling offline evaluation compares one current command per i.
+                v_sample_final.append(result["v_sample_final"][0])
             v_sample_final_norm.append(result["v_sample_final_norm"][0])
             u_final_norm.append(result["u_final_norm"][0])
             v_sample_history.append(result["v_sample_history"][:, 0, :])
@@ -925,19 +938,19 @@ def run_direct_field_inference(
     else:
         print("No aligned v_gt for point-wise comparison.")
 
-    np.savez_compressed(
-        os.path.join(out_dir, "generated_velocity_trajectory.npz"),
-        v_pred=v_sample_pred,
-        v_pred_norm=v_sample_pred_norm,
-        v_gt=v_gt if v_gt is not None else np.zeros_like(v_sample_pred),
-        step_t=step_t,
-        v_mean=stats["v_mean"],
-        v_std=stats["v_std"],
-        pd_pred=pd_pred_arr if pd_pred_arr is not None else np.array([]),
-        Rd_pred=Rd_pred_arr if Rd_pred_arr is not None else np.array([]),
-        pd_gt=pd_gt_arr if pd_gt_arr is not None else np.array([]),
-        Rd_gt=Rd_gt_arr if Rd_gt_arr is not None else np.array([]),
-    )
+    # np.savez_compressed(
+    #     os.path.join(out_dir, "generated_velocity_trajectory.npz"),
+    #     v_pred=v_sample_pred,
+    #     v_pred_norm=v_sample_pred_norm,
+    #     v_gt=v_gt if v_gt is not None else np.zeros_like(v_sample_pred),
+    #     step_t=step_t,
+    #     v_mean=stats["v_mean"],
+    #     v_std=stats["v_std"],
+    #     pd_pred=pd_pred_arr if pd_pred_arr is not None else np.array([]),
+    #     Rd_pred=Rd_pred_arr if Rd_pred_arr is not None else np.array([]),
+    #     pd_gt=pd_gt_arr if pd_gt_arr is not None else np.array([]),
+    #     Rd_gt=Rd_gt_arr if Rd_gt_arr is not None else np.array([]),
+    # )
 
     # --------------------------------------------------------
     # Visualization
@@ -1008,8 +1021,8 @@ if __name__ == "__main__":
         out_dir = f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_insertion_vis_pRFe_{type}"
 
     elif robot_task == "bolt":
-        ckpt_path = f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_boltnut_vis_pRFe_{type}/cfm_transformer_{type}_best14.pt"
-        demo_path = "/home/zhou/autolab/GUFIC_mujoco-main/boltnut3_vis_demo/bolt_demo_0000.npz"
+        ckpt_path = f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_boltnut_vis_pRFe_{type}/cfm_transformer_{type}_best32.pt"
+        demo_path = "/home/zhou/autolab/GUFIC_mujoco-main/boltnut3_vis_demo/bolt_demo_0099.npz"
         out_dir = f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_boltnut_vis_pRFe_{type}"
 
     else:

@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 # sys.path.append(r"/home/zhou/autolab/GUFIC_mujoco-main")
 import open3d as o3d
-from gufic_env.flow_matching.model import VelocityRegressiveMLP, VelocityFMTransformer, VisionDeltaPoseNet, VelocityFMTransformer, VelocityFMCondUnet1D
+from gufic_env.flow_matching.model import VelocityRegressiveMLP, VelocityFMTransformer, VisionDeltaPoseNet, VisionDeltaPoseNetV2, VelocityFMTransformer, VelocityFMCondUnet1D
 from gufic_env.flow_matching.diffusion_model.vision.pointnet import PointNetBackbone
 from gufic_env.flow_matching.dataset import rotmat_batch_to_rot6d, pointcloud_cam_to_world_batch, get_hand_eye_from_xml, uniform_sample_one_frame
 from tensorboardX import SummaryWriter
@@ -128,6 +128,7 @@ class RobotEnv:
         save_tensorboard=False,
         test_offline_cond=False,
         visualize_delta_pose=True,
+        separation_vp=True
     ):
         self.robot_name = robot_name
         self.task = task
@@ -139,6 +140,7 @@ class RobotEnv:
         self.visualize_delta_pose = visualize_delta_pose
         self.delta_pose_pred_world = None
         self.delta_pose_pred_local = None
+        self.separation_vp = separation_vp
 
         if observables is not None:
             self.observables = observables
@@ -225,7 +227,7 @@ class RobotEnv:
         self.Kp, self.KR, self.Kd, self.kp_force, self.kd_force, self.ki_force, self.zeta_v, self.zeta_w = set_gains(controller = 'GUFIC', task = self.task, sim_mode = "infer")
 
 
-        self.int_sat = 50
+        self.int_sat = 5
         self.e_force_prev = np.zeros((6, 1))
         self.int_force_prev = np.zeros((6, 1))
 
@@ -313,6 +315,8 @@ class RobotEnv:
             # self.steps = train_cfg.steps
             self.steps = train_cfg.get("infer_steps", 10)
             self.fe_queue = deque(maxlen=self.force_hist_len)
+            self.p_queue = deque(maxlen=self.x_hist_len)
+            self.R_queue = deque(maxlen=self.x_hist_len)
 
             self.velocity_model = VelocityFMTransformer(
                 x_dim=6,
@@ -500,7 +504,11 @@ class RobotEnv:
                 p = normalize_data(p, self.stats, "p").astype(np.float32)
                 # 对 R 做归一化
                 R6d = normalize_data(R6d, self.stats, "R").astype(np.float32)
-                cond_x = np.concatenate([p, R6d], axis=-1)        # [T,9]
+                self.p_queue.append(p)
+                self.R_queue.append(R6d)
+                p_hist = np.stack(list(self.p_queue), axis=0)   # [n,3]
+                R_hist = np.stack(list(self.R_queue), axis=0)   # [n,6]
+                cond_x = np.concatenate([p_hist, R_hist], axis=-1)   # [n,9]
 
                 # 对 fe 做归一化
                 Fe = normalize_data(Fe.reshape(-1, 6), self.stats, "fe").astype(np.float32)
@@ -554,7 +562,11 @@ class RobotEnv:
                 # pc_feat = self.obs_encoder(cond_pc)   # [1, embed_dim]
                 # cond = torch.cat([cond, pc_feat], dim=-1)  # [1, cond_dim]
                 guide_feat, delta_pose_pred = self.obs_encoder(cond_pc, x_now)   # [B,guide_dim], [B,9]
-
+                # guide_feat, delta_pose_pred = self.obs_encoder(
+                #     cond_pc,
+                #     x_now,
+                #     cond_hist=cond,
+                # )
                 delta_pose_pred_norm = (
                     delta_pose_pred.squeeze(0).detach().cpu().numpy().astype(np.float32)
                 )  # [9]
@@ -583,34 +595,56 @@ class RobotEnv:
                     v_t = v_t + u_pred * dt
             
                 v_sample = v_t.squeeze(0).detach().cpu().numpy().astype(np.float32)   # [T,6]
-                Vd_star_horizon = denormalize_data(v_sample, self.stats, "vd").astype(np.float32)
-                Vd_body_now = Vd_star_horizon[0]  # 取第一步的速度作为当前时刻的输出
+                # Vd_body_now = np.zeros((6,), dtype=np.float32)
                 # self.pred_vt = v_sample.copy()
-                p_des_pred, R_des_pred, delta_p_local, R_rel_pred = recover_pose_from_delta(
-                    p_now_raw=p_raw,
-                    R_now_raw=R_raw,
-                    delta_pose_pred_norm=delta_pose_pred_norm,
-                    stats=self.stats,
-                )
+                if self.separation_vp:
+                    Vd_star_horizon = denormalize_data(v_sample, self.stats, "vd").astype(np.float32)
+                    Vd_body_now = Vd_star_horizon[0]  # 取第一步的速度作为当前时刻的输出
+                    p_des_pred, R_des_pred, delta_p_local, R_rel_pred = recover_pose_from_delta(
+                        p_now_raw=p_raw,
+                        R_now_raw=R_raw,
+                        delta_pose_pred_norm=delta_pose_pred_norm,
+                        stats=self.stats,
+                    )
 
-                pd = p_des_pred
-                Rd = R_des_pred
-                dpd, dRd = vd_body_to_dpd_dRd(Vd_body_now, Rd)
+                    if self.iter % 200 == 0:
+                        print("p_now:", p_raw.reshape(3))
+                        print("pd_pred:", p_des_pred.reshape(3))
+                        print("delta_p_local:", delta_p_local.reshape(3))
+                        pd_gt = self.pd_t(self.data.time).reshape(3)
+                        print("pd_gt:", pd_gt)
+                        print("||pd_pred - pd_gt||:", np.linalg.norm(p_des_pred - pd_gt))
+                        print("||p_now - pd_gt||:", np.linalg.norm(p_raw.reshape(3) - pd_gt))
 
-                g_now = np.eye(4, dtype=np.float32)
-                g_now[:3, :3] = R_raw.reshape(3, 3)
-                g_now[:3, 3] = p_raw.reshape(3)
+                    pd = p_des_pred
+                    Rd = R_des_pred
+                    pd = self.pd_t(t).reshape(3)
+                    Rd = self.Rd_t(t)
+                    dpd, dRd = vd_body_to_dpd_dRd(Vd_body_now, Rd)
 
-                Vd_star_pred = get_velocity_field(
-                    g=g_now,
-                    pd=pd,
-                    Rd=Rd,
-                    dpd=dpd,
-                    dRd=dRd,
-                    zeta_v=self.zeta_v,
-                    zeta_w=self.zeta_w,
-                )
-                Vd_star = Vd_star_pred
+                    g_now = np.eye(4, dtype=np.float32)
+                    g_now[:3, :3] = R_raw.reshape(3, 3)
+                    g_now[:3, 3] = p_raw.reshape(3)
+
+                    Vd_star_pred = get_velocity_field(
+                        g=g_now,
+                        pd=pd,
+                        Rd=Rd,
+                        dpd=dpd,
+                        dRd=dRd,
+                        zeta_v=self.zeta_v,
+                        zeta_w=self.zeta_w,
+                    )
+                    Vd_star = Vd_star_pred
+                    if self.iter % 10 == 0:
+                        print("p-pd body:", R_raw.reshape(3,3).T @ (p_raw.reshape(3) - pd.reshape(3)))
+                        print("Vd_body_now:", Vd_body_now)
+                        print("Vd_star_pred:", Vd_star_pred)
+                        print("normal vel:", Vd_star_pred[2])
+                        print("T_i:", self.T_i)
+                else:
+                    Vd_star_horizon = denormalize_data(v_sample, self.stats, "v").astype(np.float32)
+                    Vd_star = Vd_star_horizon[0]  # 取第一步的速度作为当前时刻的输出
 
                 if self.iter == 0:
                     dVd_star = np.zeros((6,), dtype=np.float32)
@@ -1188,7 +1222,8 @@ class RobotEnv:
         Vb = self.robot_state.get_body_ee_velocity()
 
         Fe, d_Fe = self.get_FT_value(return_derivative=True)
-        print("Fe : ", Fe)
+        if self.iter % 100 == 0:
+            print("Fe : ", Fe)
         # print("d_Fe : ", d_Fe)
         Fe = Fe.reshape((-1, 1))
         d_Fe = d_Fe.reshape((-1, 1))
@@ -1238,9 +1273,13 @@ class RobotEnv:
         else:
             Vd_star, dVd_star = self.get_velocity_field(g, Vb.reshape((-1,)), t=current_t)
 
-        contact = abs(float(Fe[2])) > 2.0
-        if contact:
-            dVd_star[:] = 0.0
+        contact = abs(float(Fe[2])) > 1.0
+        # if contact:
+        #     Vd_star[2] = np.clip(Vd_star[2], -0.005, 0.005)
+        #     Vd_star[3:] = np.clip(Vd_star[3:5], -1.0, 1.0)
+        #     dVd_star[:] = 0.0
+        # else:
+        #     Vd_star[0:3] = np.clip(Vd_star[0:3], -0.4, 0.4)
 
         # optional recording of actual desired field used by controller
         if self.record_demos and self.demo_recorder is not None:
@@ -1304,6 +1343,24 @@ class RobotEnv:
             self.writer2.add_scalars("p_x", {"pd_x": self.pd_t(t)[0]}, self.golbal_steps)
             self.writer2.add_scalars("p_y", {"pd_y": self.pd_t(t)[1]}, self.golbal_steps)
             self.writer2.add_scalars("p_z", {"pd_z": self.pd_t(t)[2]}, self.golbal_steps)
+        # 姿态跟踪
+        r = RT.from_matrix(R).as_euler('xyz', degrees=True)
+        rd = RT.from_matrix(self.Rd_t(t)).as_euler('xyz', degrees=True)
+        # r[0] = r[0] % 360 # 将角度限制在 [0, 360], 避免跳变
+        if self.save_tensorboard:
+            self.writer1.add_scalars("r_x",
+                    {"r_x": r[0]}, self.golbal_steps)
+            self.writer1.add_scalars("r_y",
+                    {"r_y": r[1]}, self.golbal_steps)
+            self.writer1.add_scalars("r_z",
+                    {"r_z": r[2]}, self.golbal_steps)
+            
+            self.writer2.add_scalars("r_x",
+                    {"rd_x": rd[0]}, self.golbal_steps)
+            self.writer2.add_scalars("r_y",
+                    {"rd_y": rd[1]}, self.golbal_steps)
+            self.writer2.add_scalars("r_z",
+                    {"rd_z": rd[2]}, self.golbal_steps)
 
         ep = eg[:3, 0]
         eR = eg[3:, 0]
@@ -1421,7 +1478,7 @@ class RobotEnv:
         self.Fi_activation.append(activation_impedance)
         self.rho_list.append(rho)
         time_end = time.time()
-        print(f"time : {time_end-time_start:.4f} seconds")
+        # print(f"time : {time_end-time_start:.4f} seconds")
 
         return tau_cmd.reshape((-1,))
 
@@ -1471,9 +1528,9 @@ if __name__ == "__main__":
         fz=10
         ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_insertion_vis_pRFe_{type}/cfm_transformer_{type}_best3.pt"
     elif task == 'bolt':
-        max_time = 16
+        max_time = 12
         fz=2
-        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_boltnut_vis_pRFe_{type}/cfm_transformer_{type}_best14.pt"
+        ckpt_path=f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_boltnut_vis_pRFe_{type}/cfm_transformer_{type}_best32.pt"
 
     save_tensorboard = True
 

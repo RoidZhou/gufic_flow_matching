@@ -280,6 +280,7 @@ class VisionDeltaPoseNet(nn.Module):
         guide_feat = self.guide_proj(torch.cat([h, delta_pose_pred], dim=-1))  # [B,guide_dim]
 
         return guide_feat, delta_pose_pred
+ 
 # ============================================================
 # Flow Matching Conditional Unet1D version
 # 输入:
