@@ -1,0 +1,1291 @@
+# import mujoco
+import mujoco
+import mujoco.viewer
+import numpy as np
+import sympy as sp
+import open3d as o3d
+from scipy.linalg import expm
+
+import time, csv, os, copy
+
+import pickle
+from tensorboardX import SummaryWriter
+# import matplotlib.pyplot as plt
+import sys
+sys.path.append(r"/home/zhou/autolab/GUFIC_mujoco-main")
+from gufic_env.utils.robot_state import RobotState
+from gufic_env.utils.mujoco import set_state, set_body_pose_rotm
+from gufic_env.utils.misc_func import *
+from PIL import Image
+
+
+
+import matplotlib.pyplot as plt
+from recorder import BoltTrajectoryRecorder
+
+
+def rotmat_to_rot6d_local(R):
+    R = np.asarray(R, dtype=np.float32).reshape(3, 3)
+    return R[:, :2].T.reshape(-1).astype(np.float32)
+
+
+def make_pi0_action(pd, Rd, dpd, dRd):
+    pd = np.asarray(pd, dtype=np.float32).reshape(3)
+    Rd = np.asarray(Rd, dtype=np.float32).reshape(3, 3)
+    dpd = np.asarray(dpd, dtype=np.float32).reshape(3)
+    dRd = np.asarray(dRd, dtype=np.float32).reshape(3, 3)
+
+    Rd6d = rotmat_to_rot6d_local(Rd)
+    vd_body = Rd.T @ dpd
+    wd_body = vee_map(Rd.T @ dRd).reshape(3)
+    Vd_body = np.concatenate([vd_body, wd_body], axis=0).astype(np.float32)
+    action = np.concatenate([pd, Rd6d, Vd_body], axis=0).astype(np.float32)
+    return action, Rd6d, Vd_body
+
+class RobotEnv:
+    def __init__(self, robot_name = 'indy7', max_time = 20, show_viewer = False, fz = 5, observables = None,
+                 fix_camera = False, task = 'regulation', randomized_start = False, inertia_shaping = False,
+                 save_dir = None, save_tensorboard=False,
+                 pi0_save_dir=None,
+                 pi0_repo_id="gufic_bolt_pi0",
+                 pi0_language="insert the bolt into the hole",
+                 pi0_fps=20):
+        
+        self.robot_name = robot_name
+        self.task = task
+        self.randomized_start = randomized_start
+        self.inertia_shaping = inertia_shaping
+
+        if observables is not None:
+            self.observables = observables
+        else:
+            self.observables = ['p', 'pd', 'R', 'Rd', 'x_tf', 'x_ti', 'Fe', 'Fe_raw', 'Fd', 'rho']
+        self.demo_recorder = BoltTrajectoryRecorder(save_dir=save_dir)
+        self.fz = fz
+        self.fix_camera = fix_camera
+        self.fz_mode = "other"
+        self.golbal_steps = 0
+        self.start_from_random = False
+        self.save_tensorboard = save_tensorboard
+        self.writer = SummaryWriter('./gufic/logs')
+        self.writer1 = SummaryWriter('./gufic/logs1')
+        self.writer2 = SummaryWriter('./gufic/logs2')
+        self.pi0_save_dir = pi0_save_dir
+        self.pi0_repo_id = pi0_repo_id
+        self.pi0_language = pi0_language
+        self.pi0_fps = pi0_fps
+        self.pi0_dataset = None
+        self.pi0_enabled = pi0_save_dir is not None
+        self.pi0_episode_has_frames = False
+
+        # ==============================
+        # Point cloud camera settings
+        # ==============================
+        self.vis_point = False
+        self.camera_name = "eye_in_hand"   # 你 XML 里末端相机的名字
+        self.external_camera_name = "overview"
+        self.cam_id = -1
+        self.external_cam_id = -1
+
+        self.rgb_renderer = None
+        self.depth_renderer = None
+        self.external_rgb_renderer = None
+
+        self.cam_height = 256 if self.pi0_enabled else 128
+        self.cam_width = 256 if self.pi0_enabled else 128
+        self.num_points = 4096
+
+        self.camera_matrix = np.eye(3, dtype=np.float32)
+        self.camera_matrix_inv = np.eye(3, dtype=np.float32)
+
+        # 每几步采集一次；1 表示每一帧都采集
+        self.pointcloud_capture_every = 1
+        print('==============================================')
+        print('USING GEOMETRIC UNIFED FORCE IMPEDANCE CONTROL')
+        print('==============================================')
+
+        self.p_plate = np.array([0.50, 0.00, 0.11])
+        self.R_plate = np.array([[0, 1, 0],
+                            [1, 0, 0],
+                            [0, 0, -1]])
+        
+        if self.task == 'sphere':
+            self.p_plate = np.array([0.40, 0.00, 0.0])
+        
+        self.z_init_offset = -0.1
+
+        self.show_viewer = show_viewer
+        self.load_xml()
+
+        self.robot_state = RobotState(self.model, self.data, "end_effector", self.robot_name)
+
+        if self.task == 'insertion':
+            self.p_init = np.array([0.50, 0.0, 0.225])
+            self.R_init = np.array([[0, 1, 0],
+                               [1, 0, 0],
+                               [0, 0, -1]])
+
+            self.set_robot_to_pose(self.p_init, self.R_init)
+        elif self.task == 'bolt':
+            # self.p_init = np.array([0.50, 0.0, 0.225])
+            self.p_init = np.array([0.50, 0.0, 0.25])
+            Rd_default = np.array([[0, 1, 0],
+                               [1, 0, 0],
+                               [0, 0, -1]])
+            U, _, Vt = np.linalg.svd(Rd_default)
+            self.R_init = U @ Vt
+            self.set_robot_to_pose(self.p_init, self.R_init)
+
+        self.dt = self.model.opt.timestep
+        self.max_iter = int(max_time/self.dt)
+        self.max_time = max_time
+
+        self.iter = 0
+
+        self.Fe = np.zeros((6,1))
+        self.reset()
+
+        self.Kp, self.KR, self.Kd, self.kp_force, self.kd_force, self.ki_force, self.zeta_v, self.zeta_w = set_gains(controller = 'GUFIC', task = self.task)
+        if self.pi0_enabled:
+            self.init_pi0_dataset()
+
+        # print("Gains:", self.Kp, self.KR, self.Kd, self.kp_force, self.kd_force, self.ki_force, self.zeta)
+        # print(self.pd_t(0))
+
+    def load_xml(self):
+        # dir = "/home/joohwan/deeprl/research/GIC_Learning_public/"
+        dir = os.getcwd() + '/'
+        if self.robot_name == 'ur5e':
+            raise NotImplementedError
+
+        elif self.robot_name == 'indy7':
+            if self.task == "sphere":
+                model_path = dir + "gufic_env/mujoco_models/Indy7_wiping_sphere.xml"
+            elif self.task == "insertion":
+                model_path = dir + "gufic_env/mujoco_models/Indy7_insertion.xml"
+            elif self.task == "bolt":
+                model_path = dir + "gufic_env/mujoco_models/Indy7_nutbolt.xml"
+            else:
+                model_path = dir + "gufic_env/mujoco_models/Indy7_wiping.xml"
+
+        elif self.robot_name == 'panda':
+            raise NotImplementedError
+        
+        else:
+            raise NotImplementedError
+
+        # mujoco.mj_loadPluginLibrary(
+        #     "/home/zhou/vla/mujoco_custom/mujoco/build/lib/libsdf_plugin.so"
+        # )
+        self.model = mujoco.MjModel.from_xml_path(model_path)
+        # self.sim = mujoco.MjSim(self.model)
+
+        # Need to change self.sim with self.data 
+        self.data = mujoco.MjData(self.model)
+        self.init_camera_renderer()
+        if self.show_viewer:
+            self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            if self.fix_camera:
+                self.viewer.cam.fixedcamid = 0      # Use a predefined camera from your XML (if available)
+                self.viewer.cam.trackbodyid = -1      # Disable tracking any body
+                # Alternatively, if you want to set a free camera pose manually:
+                self.viewer.cam.lookat = np.array([0.5, 0.0, 0.3])  # Center of the scene
+                self.viewer.cam.distance = 1.5                     # Distance from the lookat point
+                self.viewer.cam.azimuth = 180                       # Horizontal angle in degrees
+                self.viewer.cam.elevation = -20                    # Vertical angle in degrees
+        else:
+            self.viewer = None
+
+    def init_camera_renderer(self):
+        """
+        初始化 RGB 和 Depth renderer，并计算相机内参。
+        """
+        self.cam_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_CAMERA,
+            self.camera_name
+        )
+        self.external_cam_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_CAMERA,
+            self.external_camera_name
+        )
+
+        if self.cam_id < 0:
+            raise ValueError(f"Camera '{self.camera_name}' not found in XML.")
+        if self.external_cam_id < 0:
+            raise ValueError(f"Camera '{self.external_camera_name}' not found in XML.")
+
+        self.rgb_renderer = mujoco.Renderer(
+            self.model,
+            height=self.cam_height,
+            width=self.cam_width
+        )
+        self.external_rgb_renderer = mujoco.Renderer(
+            self.model,
+            height=self.cam_height,
+            width=self.cam_width
+        )
+
+        self.depth_renderer = mujoco.Renderer(
+            self.model,
+            height=self.cam_height,
+            width=self.cam_width
+        )
+        self.depth_renderer.enable_depth_rendering()
+
+        # MuJoCo cam_fovy 单位是 degree
+        fovy = np.deg2rad(self.model.cam_fovy[self.cam_id])
+
+        fy = self.cam_height / (2.0 * np.tan(fovy / 2.0))
+        fx = fy
+        cx = self.cam_width / 2.0
+        cy = self.cam_height / 2.0
+
+        self.camera_matrix = np.array([
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0]
+        ], dtype=np.float32)
+
+        self.camera_matrix_inv = np.linalg.inv(self.camera_matrix).astype(np.float32)
+
+        print(f"[Camera] name={self.camera_name}, id={self.cam_id}, fovy={np.rad2deg(fovy):.2f}")
+        print(f"[Camera] external={self.external_camera_name}, id={self.external_cam_id}")
+        print(f"[Camera] K=\n{self.camera_matrix}")
+
+    def init_pi0_dataset(self):
+        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+        if os.path.exists(self.pi0_save_dir) and os.listdir(self.pi0_save_dir):
+            episodes_path = os.path.join(self.pi0_save_dir, "meta", "episodes.jsonl")
+            if not os.path.exists(episodes_path):
+                raise RuntimeError(
+                    "Incomplete LeRobot dataset root: "
+                    f"{self.pi0_save_dir}\n"
+                    "meta/episodes.jsonl is missing, so no episode has been fully saved. "
+                    "Please rename/delete this partial directory or collect into a new pi0_save_dir."
+                )
+            self.pi0_dataset = LeRobotDataset(self.pi0_repo_id, root=self.pi0_save_dir, local_files_only=True)
+        else:
+            self.pi0_dataset = LeRobotDataset.create(
+                repo_id=self.pi0_repo_id,
+                root=self.pi0_save_dir,
+                robot_type=self.robot_name,
+                fps=self.pi0_fps,
+                features={
+                    "observation.wrist_image": {
+                        "dtype": "image",
+                        "shape": (256, 256, 3),
+                        "names": ["height", "width", "channels"],
+                    },
+                    "observation.external_image": {
+                        "dtype": "image",
+                        "shape": (256, 256, 3),
+                        "names": ["height", "width", "channels"],
+                    },
+                    "observation.robot_state": {
+                        "dtype": "float32",
+                        "shape": (9,),
+                        "names": ["robot_state"],
+                    },
+                    "observation.force": {
+                        "dtype": "float32",
+                        "shape": (6,),
+                        "names": ["force"],
+                    },
+                    "action": {
+                        "dtype": "float32",
+                        "shape": (15,),
+                        "names": ["action"],
+                    },
+                    "action.pd": {
+                        "dtype": "float32",
+                        "shape": (3,),
+                        "names": ["pd"],
+                    },
+                    "action.Rd6d": {
+                        "dtype": "float32",
+                        "shape": (6,),
+                        "names": ["Rd6d"],
+                    },
+                    "action.Vd_body": {
+                        "dtype": "float32",
+                        "shape": (6,),
+                        "names": ["Vd_body"],
+                    },
+                },
+                image_writer_threads=10,
+                image_writer_processes=5,
+            )
+        print(f"[Pi0] LeRobot dataset enabled: root={self.pi0_save_dir}, repo_id={self.pi0_repo_id}")
+
+    def get_camera_rgbd(self):
+        """
+        从指定相机采集 RGB 和深度图。
+        """
+        self.rgb_renderer.update_scene(self.data, camera=self.cam_id)
+        rgb = self.rgb_renderer.render()
+
+        self.depth_renderer.update_scene(self.data, camera=self.cam_id)
+        depth = self.depth_renderer.render()
+
+        return rgb, depth
+
+    def get_camera_rgb(self, camera_id):
+        self.rgb_renderer.update_scene(self.data, camera=camera_id)
+        return self.rgb_renderer.render()
+
+    def get_external_rgb(self):
+        self.external_rgb_renderer.update_scene(self.data, camera=self.external_cam_id)
+        return self.external_rgb_renderer.render()
+
+    @staticmethod
+    def resize_rgb(image, size=(256, 256)):
+        image = np.asarray(image, dtype=np.uint8)
+        if image.shape[0] == size[1] and image.shape[1] == size[0]:
+            return image
+        return np.asarray(Image.fromarray(image).resize(size), dtype=np.uint8)
+
+    def add_pi0_frame(self, p, R, Fe, pd, Rd, dpd, dRd):
+        if self.pi0_dataset is None:
+            return
+
+        wrist_image = self.resize_rgb(self.get_camera_rgb(self.cam_id))
+        external_image = self.resize_rgb(self.get_external_rgb())
+        robot_state = np.concatenate(
+            [
+                np.asarray(p, dtype=np.float32).reshape(3),
+                rotmat_to_rot6d_local(R),
+            ],
+            axis=0,
+        ).astype(np.float32)
+        action, Rd6d, Vd_body = make_pi0_action(pd, Rd, dpd, dRd)
+
+        frame = {
+            "observation.wrist_image": wrist_image,
+            "observation.external_image": external_image,
+            "observation.robot_state": robot_state,
+            "observation.force": np.asarray(Fe, dtype=np.float32).reshape(6),
+            "action": action,
+            "action.pd": np.asarray(pd, dtype=np.float32).reshape(3),
+            "action.Rd6d": Rd6d,
+            "action.Vd_body": Vd_body,
+        }
+
+        self.pi0_dataset.add_frame(frame, task=self.pi0_language)
+        self.pi0_episode_has_frames = True
+
+    def save_pi0_episode(self):
+        if self.pi0_dataset is not None and self.pi0_episode_has_frames:
+            self.pi0_dataset.save_episode()
+            self.pi0_episode_has_frames = False
+
+    def clear_pi0_episode(self):
+        if self.pi0_dataset is not None:
+            self.pi0_dataset.clear_episode_buffer()
+            self.pi0_episode_has_frames = False
+
+    def rgbd_to_point_cloud(self, rgb, depth):
+        """
+        将 RGB-D 图像反投影为点云。
+        输出 shape: [N, 6]，每个点为 [x, y, z, r, g, b]
+        注意：这里的 xyz 是相机坐标系下的点云。
+        """
+        H, W = depth.shape
+        u, v = np.meshgrid(np.arange(W), np.arange(H))
+
+        ones = np.ones_like(u, dtype=np.float32)
+        pixels = np.stack([u, v, ones], axis=-1).reshape(-1, 3).astype(np.float32)
+
+        z = depth.reshape(-1, 1).astype(np.float32)
+
+        xyz = (pixels @ self.camera_matrix_inv.T) * z
+        rgb_flat = rgb.reshape(-1, 3).astype(np.float32)
+
+        point_cloud = np.concatenate([xyz, rgb_flat], axis=1)
+
+        # 过滤无效点和过远点
+        valid = np.isfinite(point_cloud).all(axis=1)
+        valid &= point_cloud[:, 2] > 0.0
+        valid &= point_cloud[:, 2] < 0.3
+
+        point_cloud = point_cloud[valid]
+
+        return self.uniform_sample_point_cloud(point_cloud)
+
+    def uniform_sample_point_cloud(self, point_cloud):
+        """
+        随机采样固定数量点。
+        如果有效点不足，则允许重复采样。
+        """
+        if point_cloud.shape[0] == 0:
+            return np.zeros((self.num_points, 6), dtype=np.float32)
+
+        replace = point_cloud.shape[0] < self.num_points
+        idx = np.random.choice(
+            point_cloud.shape[0],
+            size=self.num_points,
+            replace=replace
+        )
+
+        return point_cloud[idx].astype(np.float32)
+
+    def capture_point_cloud(self):
+        """
+        采集当前帧点云。
+        """
+        rgb, depth = self.get_camera_rgbd()
+        point_cloud = self.rgbd_to_point_cloud(rgb, depth)
+        return point_cloud
+
+    def visualize_point_cloud_once(self):
+        """
+        采集当前相机的一帧点云并用 Open3D 可视化。
+        点云格式：[x, y, z, r, g, b]
+        """
+        point_cloud = self.capture_point_cloud()
+
+        if point_cloud is None or point_cloud.shape[0] == 0:
+            print("[PointCloud] Empty point cloud.")
+            return
+
+        xyz = point_cloud[:, :3]
+        rgb = point_cloud[:, 3:] / 255.0
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz)
+        pcd.colors = o3d.utility.Vector3dVector(rgb)
+
+        print("[PointCloud] shape:", point_cloud.shape)
+        print("[PointCloud] xyz min:", xyz.min(axis=0))
+        print("[PointCloud] xyz max:", xyz.max(axis=0))
+
+        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=0.1,
+            origin=[0, 0, 0]
+        )
+
+        o3d.visualization.draw_geometries(
+            [pcd, frame],
+            window_name="Eye-in-hand Point Cloud",
+            width=960,
+            height=720
+        )
+    
+    def set_robot_to_pose(self, p_des, R_des):
+        """
+        通过 IK 将机器人直接设置到指定末端位姿。
+        p_des: shape (3,)
+        R_des: shape (3, 3)
+        """
+        p_des = np.asarray(p_des, dtype=np.float64).reshape(3)
+        R_des = np.asarray(R_des, dtype=np.float64).reshape(3, 3)
+
+        if self.model.nv == 6:
+            q0 = np.array([0, 0, -np.pi / 2, 0, -np.pi / 2, np.pi / 2])
+        elif self.model.nv == 8:
+            q0 = np.array([0, 0, -np.pi / 2, 0, -np.pi / 2, np.pi / 2, 0, 0])
+        elif self.model.nv == 10:
+            q0 = np.array([0, 0, -np.pi / 2, 0, -np.pi / 2, np.pi / 2, 0, 0, 0, 0])
+        else:
+            q0 = np.zeros(self.model.nv)
+
+        self.robot_state.gauss_newton_IK(p_des, R_des, q0)
+
+        mujoco.mj_forward(self.model, self.data)
+        self.robot_state.update()
+
+        if self.show_viewer and self.viewer is not None:
+            self.viewer.sync()
+
+    def reset(self, angle_prefix=None):
+        self.iter = 0
+
+        if self.task in ["insertion", "bolt"]:
+            pd = self.p_init
+            Rd = self.R_init
+        else:
+            # 先生成轨迹，保证非 insertion 任务能取 pd_t(0), Rd_t(0)
+            self.pd_t, self.Rd_t, self.dpd_t, self.dRd_t, self.ddpd_t, self.ddRd_t = initialize_trajectory(
+                task=self.task,
+                max_time=self.max_time,
+                robot_state=self.robot_state
+            )
+            pd = self.pd_t(0)
+            Rd = self.Rd_t(0)
+
+        if self.randomized_start:
+            rand_xy = 2 * (np.random.rand(2,) - 0.5) * 0.05
+            rand_rpy = 2 * (np.random.rand(3,) - 0.5) * 15 / 180 * np.pi
+        else:
+            rand_xy = np.array([0.05, -0.05])
+            rand_rpy = np.array([15, -15, 15]) * np.pi / 180
+
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(rand_rpy[0]), -np.sin(rand_rpy[0])],
+            [0, np.sin(rand_rpy[0]),  np.cos(rand_rpy[0])]
+        ])
+        Ry = np.array([
+            [ np.cos(rand_rpy[1]), 0, np.sin(rand_rpy[1])],
+            [0, 1, 0],
+            [-np.sin(rand_rpy[1]), 0, np.cos(rand_rpy[1])]
+        ])
+        Rz = np.array([
+            [np.cos(rand_rpy[2]), -np.sin(rand_rpy[2]), 0],
+            [np.sin(rand_rpy[2]),  np.cos(rand_rpy[2]), 0],
+            [0, 0, 1]
+        ])
+
+        p_init = pd.reshape((-1, 1)) + Rd @ np.array(
+            [rand_xy[0], rand_xy[1], self.z_init_offset]
+        ).reshape(-1, 1)
+
+        R_init = Rd @ Rz @ Ry @ Rx
+        p_init = p_init.reshape((-1,))
+
+        if self.model.nv == 8:
+            q0 = np.array([0, 0, -np.pi/2, 0, -np.pi/2, np.pi/2, 0, 0])
+        elif self.model.nv == 6:
+            q0 = np.array([0, 0, -np.pi/2, 0, -np.pi/2, np.pi/2])
+        elif self.model.nv == 10:
+            q0 = np.array([0, 0, -np.pi/2, 0, -np.pi/2, np.pi/2, 0, 0, 0, 0])
+        else:
+            q0 = np.zeros(self.model.nv)
+
+        self.robot_state.gauss_newton_IK(p_init, R_init, q0)
+
+        self.Fe = np.zeros((6, 1))
+        obs = np.zeros((6, 1))
+
+        Rt = np.eye(3)
+        self.set_hole_pose(self.p_plate, Rt)
+
+        self.robot_state.update()
+
+        # insertion 会从当前真实初始位姿开始
+        if self.task in ["insertion", "bolt"]:
+            self.pd_t, self.Rd_t, self.dpd_t, self.dRd_t, self.ddpd_t, self.ddRd_t = initialize_trajectory(
+                task=self.task,
+                max_time=self.max_time,
+                robot_state=self.robot_state
+            )
+
+        p, R = self.robot_state.get_pose()
+
+        self.gd = np.eye(4)
+        self.gd[:3, 3] = p
+        self.gd[:3, :3] = R
+
+        if self.show_viewer:
+            self.viewer.sync()
+
+        self.int_sat = 50
+
+        ## For the force tracking
+        self.e_force_prev = np.zeros((6,1))
+        self.int_force_prev = np.zeros((6,1))
+        self.force_bias = self.get_FT_value().reshape(6,1)
+
+        ## For the energy tank
+        self.T_f_low = 0.5
+        self.T_f_high = 20
+        self.delta_f = 1
+
+        self.T_i_low = 0.5
+        self.T_i_high = 20
+        self.delta_i = 1
+
+        T_i_init = 10
+        T_f_init = 10
+
+        if self.task == 'sphere':
+            T_i_init = 90
+            self.T_i_high = 100
+
+        self.x_tf = np.sqrt(2 * T_f_init)
+        self.x_ti = np.sqrt(2 * T_i_init)
+
+        self.T_f = 0.5 * self.x_tf**2
+        self.T_i = 0.5 * self.x_ti**2
+
+        self.d_max = 0.03
+        self.eR_norm_max = 0.05
+
+        ####### Dummy for the printing
+        self.Ff_list = []
+        self.Vb_list = []
+        self.Ff_activation = []
+        self.rho_list = []
+        self.Fd_star_list = []
+        self.Fi_activation = []
+
+        print('Initialization Complete')
+        time.sleep(2)
+
+        return obs
+
+    def run(self):
+        p_list = []
+        R_list = []
+        x_tf_list = []
+        x_ti_list = []
+        Fe_list = []
+        Fd_list = []
+
+        Fe_raw_list = []
+
+        pd_list = []
+
+
+        for i in range(self.max_iter):
+            self.golbal_steps = i
+
+            pd, Rd, vd, wd, dvd, dwd = self.update_desired_trajectory()
+
+            obs, reward, done, info = self.step()
+
+            p, R = self.robot_state.get_pose()
+            Fe = self.get_FT_value()
+            Fe_raw = self.get_FT_value_raw()
+            force_x = Fe_raw[0]
+            force_y = Fe_raw[1]
+            force_z = Fe_raw[2]
+            torque_x = Fe_raw[3]
+            torque_y = Fe_raw[4]
+            torque_z = Fe_raw[5]
+            # self.writer.add_scalars("force_x",
+            #                        {"force_x": force_x}, self.golbal_steps)
+            # self.writer.add_scalars("force_y",
+            #                        {"force_y": force_y}, self.golbal_steps)
+            # self.writer.add_scalars("force_z",
+            #                        {"force_z": force_z}, self.golbal_steps)
+            # self.writer.add_scalars("torque_x",
+            #                        {"torque_x": torque_x}, self.golbal_steps)
+            # self.writer.add_scalars("torque_y",
+            #                        {"torque_y": torque_y}, self.golbal_steps)
+            # self.writer.add_scalars("torque_z",
+            #                        {"torque_z": torque_z}, self.golbal_steps)   
+            p_list.append(p)
+            R_list.append(R)
+            x_tf_list.append(self.x_tf)
+            x_ti_list.append(self.x_ti)
+            Fe_list.append(Fe)
+            Fe_raw_list.append(Fe_raw)
+            Fd_list.append(0)
+            pd_list.append(pd)
+
+            # print(reward)
+
+            if self.show_viewer:
+                if i % 10 == 0:
+                    self.viewer.sync()
+                # if i in [4000]:
+                    # print('Stopping here')
+                    # pass
+
+            if i % 1000 == 0:
+                print(f"Time Step: {i}")
+            # 测试单帧点云
+            if self.vis_point and i % 2000 == 0:
+                self.visualize_point_cloud_once()
+            if done:
+                break
+
+            # self.iter = i
+
+        return p_list, R_list, x_tf_list, x_ti_list, Fe_list, Fd_list, pd_list, Fe_raw_list
+    
+    def update_desired_trajectory(self):
+        # Return pd, Rd, vd, wd, dvd, dwd
+        t = self.iter * self.dt
+        pd = self.pd_t(t)
+        Rd = self.Rd_t(t)
+
+        dpd = self.dpd_t(t)
+        dRd = self.dRd_t(t)
+
+        ddpd = self.ddpd_t(t)
+        ddRd = self.ddRd_t(t)
+
+
+        vd = Rd.T @ dpd.reshape((-1,1))
+        wd = vee_map(Rd.T @ dRd)
+
+        dvd = Rd.T @ ddpd.reshape((-1,1)) - hat_map(wd) @ Rd.T @ dpd.reshape((-1,1))
+        dwd = vee_map(Rd.T @ ddRd - hat_map(wd) @ Rd.T @ dRd)
+
+        return pd.reshape((-1,)), Rd, vd.reshape((-1,)), wd.reshape((-1,)), dvd.reshape((-1,)), dwd.reshape((-1,))
+    
+    def get_velocity_field(self, g, V, t):
+        zeta_v = self.zeta_v  # 速度场参数
+        zeta_w = self.zeta_w  # 速度场参数
+        pd = self.pd_t(t).reshape((-1,))
+        Rd = self.Rd_t(t)
+
+        dpd = self.dpd_t(t).reshape((-1,))
+        dRd = self.dRd_t(t)
+
+        self.rec_pd = pd
+        self.rec_Rd = Rd
+        self.rec_dpd = dpd
+        self.rec_dRd = dRd
+        ddpd = self.ddpd_t(t).reshape((-1,))
+        ddRd = self.ddRd_t(t)
+
+        p = g[:3,3]
+        R = g[:3,:3]
+
+        v = V[:3] 
+        w = V[3:]
+
+        Vd_star = np.zeros(6,)
+        vd_star = R.T @ dRd @ Rd.T @ (p - pd) + R.T @ dpd - zeta_v * R.T @ (p - pd)
+        wd_star = vee_map(R.T @ dRd @ Rd.T @ R - zeta_w * (Rd.T @ R - R.T @ Rd)).reshape((-1,))
+
+        Vd_star[:3] = vd_star
+        Vd_star[3:] = wd_star
+
+        dVd_star = np.zeros(6,)
+        term1 = -hat_map(w) @ R.T @ dRd @ Rd.T @ R + R.T @ ddRd @ Rd.T @ R + R.T @ dRd @ dRd.T @ R + R.T @ dRd @ Rd.T @ R @ hat_map(w)
+        term2 = -hat_map(w) @ R.T @ dRd @ Rd.T @ (p - pd) + R.T @ ddRd @ Rd.T @ (p - pd) + R.T @ dRd @ dRd.T @ (p - pd) \
+                + R.T @ dRd @ Rd.T @ (R.T @ v - pd) - hat_map(w) @ R.T @ dpd + R.T @ ddpd
+        term3 = dRd.T @ R + Rd.T @ R @ hat_map(w) + hat_map(w) @ R.T @ Rd - R.T @ dRd
+        term4 = - hat_map(w) @ R.T @ (p - pd) + v - R.T @ dpd
+        dvd_star = term2 - zeta_v * term4
+        dwd_star = vee_map(term1 - zeta_w * term3).reshape((-1,))
+
+        dVd_star[:3] = dvd_star
+        dVd_star[3:] = dwd_star
+
+        return Vd_star, dVd_star
+
+
+    def step(self):
+        self.robot_state.update()
+
+        tau_cmd = self.geometric_unified_force_impedance_control()
+        gripper = 0.03
+
+        self.robot_state.set_control_torque(tau_cmd, gripper) # 机器人力矩控制
+
+        self.robot_state.update_dynamic() # 更新仿真环境
+
+        if self.show_viewer:
+            self.viewer.sync()
+
+        q = self.data.qpos[:6].copy()
+        dq = self.data.qvel[:6].copy()
+
+        q_min = self.model.jnt_range[:6, 0]
+        q_max = self.model.jnt_range[:6, 1]
+
+        if np.any((q - q_min < 0.05) | (q_max - q < 0.05)):
+            print("===== JOINT NEAR LIMIT =====")
+            print("step:", self.golbal_steps)
+            print("q rad:", q)
+            print("q deg:", np.rad2deg(q))
+            print("q_min deg:", np.rad2deg(q_min))
+            print("q_max deg:", np.rad2deg(q_max))
+            print("margin low deg:", np.rad2deg(q - q_min))
+            print("margin high deg:", np.rad2deg(q_max - q))
+
+        obs = {}
+        # Put observables in the obs variable
+        p, R = self.robot_state.get_pose()
+
+        pd = self.pd_t(self.iter * self.dt).reshape((-1,))
+        Rd = self.Rd_t(self.iter * self.dt)
+
+        for obs_name in self.observables:
+            if obs_name == 'p':
+                obs['p'] = p
+            elif obs_name == 'pd':
+                obs['pd'] = pd
+            elif obs_name == 'R':
+                obs['R'] = R
+            elif obs_name == 'Rd':
+                obs['Rd'] = Rd
+            elif obs_name == 'x_tf':
+                obs['x_tf'] = self.x_tf
+            elif obs_name == 'x_ti':
+                obs['x_ti'] = self.x_ti
+            elif obs_name == 'Fe':
+                obs['Fe'] = self.get_FT_value()
+            elif obs_name == 'Fe_raw':
+                obs['Fe_raw'] = self.get_FT_value_raw()
+            elif obs_name == 'Fd':
+                obs['Fd'] = self.get_force_field(self.gd, self.gd)
+            elif obs_name == 'rho':
+                obs['rho'] = self.rho
+            elif obs_name == 'Psi':
+                obs['Psi'] = 0.5 * np.linalg.norm(p - pd)**2 + np.trace(np.eye(3) - Rd.T @ R)
+            else:
+                raise ValueError('Invalid observable name')
+
+        if self.iter == self.max_iter -1:
+            done = True
+        else:
+            done = False
+
+        reward = 0
+        info = dict()
+
+        self.iter +=1 
+
+        return obs, reward, done, info
+    
+    def get_FT_value(self, return_derivative = False):
+        Fe, dFe = self.robot_state.get_ee_force()
+        if return_derivative:
+            return -Fe, -dFe
+        else:
+            return -Fe
+        
+    def get_FT_value_raw(self):
+        Fe, dFe = self.robot_state.get_ee_force_raw()
+        return -Fe
+    
+    def get_eg(self, g, gd):
+        p = g[:3,3]
+        R = g[:3,:3]
+
+        pd = gd[:3,3]
+        Rd = gd[:3,:3]
+
+        ep = R.T @ (p - pd)
+        eR = vee_map(Rd.T @ R - R.T @ Rd).reshape((-1,))
+
+        return np.hstack((ep, eR)).reshape((-1,1))
+    
+    def get_force_field(self,g, gd):
+        fz = self.fz
+
+        Fd = np.array([0, 0, fz, 0, 0, 0])
+        return Fd
+
+    def check_task_success(self):
+
+        p, R = self.robot_state.get_pose()
+
+        t = self.max_time
+
+        pd = self.pd_t(t).reshape(-1)
+        Rd = self.Rd_t(t)
+
+        # -----------------------------
+        # position error
+        # -----------------------------
+        pos_err = np.linalg.norm(p - pd)
+
+        # -----------------------------
+        # rotation error
+        # -----------------------------
+        rot_err_mat = Rd.T @ R
+
+        trace_val = np.clip(
+            (np.trace(rot_err_mat) - 1) / 2,
+            -1.0,
+            1.0
+        )
+
+        rot_err = np.arccos(trace_val)
+
+        # -----------------------------
+        # success threshold
+        # -----------------------------
+        success = (
+            pos_err < 0.002
+        )
+
+        print("================================")
+        print(f"Final Pos Error : {pos_err:.6f}")
+        print(f"Final Rot Error : {np.rad2deg(rot_err):.3f}")
+        print(f"Task Success    : {success}")
+        print("================================")
+
+        return success
+
+    def geometric_unified_force_impedance_control(self):
+        Jb = self.robot_state.get_body_jacobian() # 雅可比矩阵
+
+        # M,C,G = self.robot_state.get_dynamic_matrices()
+        qfrc_bias = self.robot_state.get_bias_torque() # 关节空间偏置力矩，包括重力、科氏力
+        M = self.robot_state.get_full_inertia() # 关节空间惯性矩阵
+
+        #0 Get impedance gains
+        Kp = self.Kp
+        KR = self.KR
+
+        p, R = self.robot_state.get_pose()
+
+        g = np.eye(4)
+        g[:3,:3] = R
+        g[:3,3] = p
+
+        Vb = self.robot_state.get_body_ee_velocity() # Shape: (6,1) 末端速度
+
+        # Update trajectory values
+        Vd_star, dVd_star = self.get_velocity_field(g, Vb.reshape((-1,)), t = self.iter * self.dt)
+        # self.writer.add_scalars("Vd_star_x",
+        #                 {"Vd_star_x": Vd_star[0]}, self.golbal_steps)
+        # self.writer.add_scalars("Vd_star_y",
+        #                 {"Vd_star_y": Vd_star[1]}, self.golbal_steps)
+        # self.writer.add_scalars("Vd_star_z",
+        #                 {"Vd_star_z": Vd_star[2]}, self.golbal_steps)
+        # self.writer.add_scalars("Vd_star_rx",
+        #                 {"Vd_star_rx": Vd_star[3]}, self.golbal_steps)
+        # self.writer.add_scalars("Vd_star_ry",
+        #                 {"Vd_star_ry": Vd_star[4]}, self.golbal_steps)
+        # self.writer.add_scalars("Vd_star_rz",
+        #                 {"Vd_star_rz": Vd_star[5]}, self.golbal_steps)
+        Vd_star = Vd_star.reshape((-1,1))
+        dVd_star = dVd_star.reshape((-1,1))
+
+        #Original GIC Law placeholder
+        gd = self.gd
+        Rd = gd[:3,:3]
+        pd = gd[:3,3]
+
+        g_ed = np.linalg.inv(g) @ gd
+
+        #1 Calculate positional force
+        fp = R.T @ Rd @ Kp @ Rd.T @ (p - pd).reshape((-1,1))
+        fR = vee_map(KR @ Rd.T @ R - R.T @ Rd @ KR)
+
+        fg = np.vstack((fp,fR))
+        gd_bar = np.eye(4)
+        t = self.iter * self.dt
+        gd_bar[:3,:3] = self.Rd_t(t)
+        gd_bar[:3,3] = self.pd_t(t).reshape((-1,))
+        Fd_star = self.get_force_field(g, gd_bar).reshape((-1,1))
+
+        Fe, d_Fe = self.get_FT_value(return_derivative=True)
+        # print("Fe : ", Fe)
+        # print("d_Fe : ", d_Fe)
+        # print("Fe : ", Fe)
+        Fe = Fe.reshape((-1,1))
+        d_Fe = d_Fe.reshape((-1,1))
+        force_x = Fe[0]
+        force_y = Fe[1]
+        force_z = Fe[2]
+        torque_x = Fe[3]
+        torque_y = Fe[4]
+        torque_z = Fe[5]
+        if self.save_tensorboard:
+            self.writer.add_scalars("force_x",
+                                    {"force_x": force_x}, self.golbal_steps)
+            self.writer.add_scalars("force_y",
+                                    {"force_y": force_y}, self.golbal_steps)
+            self.writer.add_scalars("force_z",
+                                    {"force_z": force_z}, self.golbal_steps)
+            self.writer.add_scalars("torque_x",
+                                    {"torque_x": torque_x}, self.golbal_steps)
+            self.writer.add_scalars("torque_y",
+                                    {"torque_y": torque_y}, self.golbal_steps)
+            self.writer.add_scalars("torque_z",
+                                    {"torque_z": torque_z}, self.golbal_steps)   
+        # NOTE(JS) Working is version is that to put e_force = - Fe - Fd, with the Fe = -self.robot_state.get_ee_force()
+        # Fd should be positive as well
+
+        e_force = -Fe - Fd_star
+        de_force = -d_Fe
+        int_force = self.int_force_prev + e_force * self.dt
+
+
+        int_force = np.clip(int_force, -self.int_sat, self.int_sat)
+
+        if self.fz_mode == "time-varying": # Regular PID Control
+            F_f = - self.kp_force * e_force - self.kd_force * de_force - self.ki_force * int_force + Fd_star
+        else: # Integral action with minor loop
+            F_f = - self.kp_force * (-Fe) - self.ki_force * int_force - self.kd_force * de_force + Fd_star
+        # print("F_f : ", F_f)
+        #2.5 Apply shaping function to the force control input
+        f_d = Fd_star[:3].reshape((-1,))
+        m_d = Fd_star[3:].reshape((-1,))
+
+        if self.iter % self.pointcloud_capture_every == 0:
+            point_cloud = self.capture_point_cloud()
+        else:
+            point_cloud = None
+
+        self.demo_recorder.add(
+            t=self.iter * self.dt,
+            p=p,
+            R=R,
+            pd=self.rec_pd,
+            Rd=self.rec_Rd,
+            dpd=self.rec_dpd,
+            dRd=self.rec_dRd,
+            Vd_star=np.asarray(Vd_star).reshape(6),
+            dVd_star=np.asarray(dVd_star).reshape(6),
+            Fe=np.asarray(Fe).reshape(6),
+            point_cloud=point_cloud,
+        )
+        self.add_pi0_frame(
+            p=p,
+            R=R,
+            Fe=np.asarray(Fe).reshape(6),
+            pd=self.rec_pd,
+            Rd=self.rec_Rd,
+            dpd=self.rec_dpd,
+            dRd=self.rec_dRd,
+        )
+
+        gd_t = np.eye(4)
+        gd_t[:3,:3] = self.Rd_t(t)
+        gd_t[:3,3] = self.pd_t(t).reshape((-1,))
+        eg = self.get_eg(g, gd_t)
+
+        # 位置跟踪
+        if self.save_tensorboard:
+            self.writer1.add_scalars("p_x",
+                    {"p_x": p[0]}, self.golbal_steps)
+            self.writer1.add_scalars("p_y",
+                    {"p_y": p[1]}, self.golbal_steps)
+            self.writer1.add_scalars("p_z",
+                    {"p_z": p[2]}, self.golbal_steps)
+            
+            self.writer2.add_scalars("p_x",
+                    {"pd_x": self.pd_t(t)[0]}, self.golbal_steps)
+            self.writer2.add_scalars("p_y",
+                    {"pd_y": self.pd_t(t)[1]}, self.golbal_steps)
+            self.writer2.add_scalars("p_z",
+                    {"pd_z": self.pd_t(t)[2]}, self.golbal_steps)
+        
+        # 姿态跟踪
+        r = RT.from_matrix(R).as_euler('xyz', degrees=True)
+        rd = RT.from_matrix(self.Rd_t(t)).as_euler('xyz', degrees=True)
+        # r[0] = r[0] % 360 # 将角度限制在 [0, 360], 避免跳变
+        if self.save_tensorboard:
+            self.writer1.add_scalars("r_x",
+                    {"r_x": r[0]}, self.golbal_steps)
+            self.writer1.add_scalars("r_y",
+                    {"r_y": r[1]}, self.golbal_steps)
+            self.writer1.add_scalars("r_z",
+                    {"r_z": r[2]}, self.golbal_steps)
+            
+            self.writer2.add_scalars("r_x",
+                    {"rd_x": rd[0]}, self.golbal_steps)
+            self.writer2.add_scalars("r_y",
+                    {"rd_y": rd[1]}, self.golbal_steps)
+            self.writer2.add_scalars("r_z",
+                    {"rd_z": rd[2]}, self.golbal_steps)
+
+        ep = eg[:3,0]
+        eR = eg[3:,0]
+
+        rho_p = np.zeros((3,))
+        rho_R = np.zeros((3,))
+
+        if ep @ f_d <= 0:
+            rho_p[:3] = 1
+        elif ep @ f_d > 0:
+            for i in range(3):
+                if np.abs(ep[i]) <= self.d_max:
+                    rho_p[i] = 0.5 * (1 + np.cos(np.pi * ep[i] / self.d_max))
+                elif np.abs(f_d[i]) <= 0.05:
+                    rho_p[i] = 0
+        else:
+            rho_p[:3] = 0
+
+        eR_norm = np.linalg.norm(eR)
+        if eR @ m_d <= 0:
+            rho_R[:3] = 1
+        elif eR @ m_d > 0:
+            if eR_norm >= self.eR_norm_max:
+                rho_R[:3] = 0.5 * (1 + np.cos(np.pi * eR_norm / self.eR_norm_max))
+        else:
+            rho_R[:3] = 0
+        # self.writer.add_scalars("rho_Rx",
+        #                 {"rho_Rx": rho_R[0]}, self.golbal_steps)
+        # self.writer.add_scalars("rho_Ry",
+        #                 {"rho_Ry": rho_R[1]}, self.golbal_steps)
+        # self.writer.add_scalars("rho_Rz",
+        #                 {"rho_Rz": rho_R[2]}, self.golbal_steps)
+        rho = np.block([rho_p, rho_R]).reshape((-1,1))
+        self.rho = rho
+
+        # ensure element-wise multiplication
+        F_f = F_f * rho
+
+        self.e_force_prev = e_force
+        self.int_force_prev = int_force
+
+        # get a scalar value of the inner product of Vb and F_f without any numpy array
+        inner_product_f = (Vb.T @ F_f).reshape((-1,))[0]
+
+        self.T_f = 0.5 * self.x_tf**2
+
+        if inner_product_f < 0:
+            gamma_f = 1
+        else:
+            gamma_f = 0
+
+        if self.T_f <= self.T_f_high:
+            beta_f = 1
+        else:
+            beta_f = 0
+
+        if self.T_f >= self.T_f_low + self.delta_f:
+            alpha_f = 1
+        elif self.T_f <= self.T_f_low + self.delta_f and self.T_f >= self.T_f_low:
+            alpha_f = 0.5 * (1 - np.cos(np.pi * (self.T_f - self.T_f_low) / self.delta_f))
+        elif self.T_f < self.T_f_low:
+            alpha_f = 0
+        
+        dx_tf = - (beta_f / self.x_tf) * gamma_f * inner_product_f + (alpha_f / self.x_tf) * (gamma_f -1) * inner_product_f
+        self.x_tf = self.x_tf + dx_tf * self.dt
+        self.T_f = 0.5 * self.x_tf**2
+
+        activation_force = gamma_f + alpha_f * (1 - gamma_f)
+        F_f_mod = activation_force * F_f
+
+        #4. Modified Impedance Control
+        inner_product_i = (Vd_star.T @ (F_f_mod + Fe)).reshape((-1,))[0]
+
+        self.T_i = 0.5 * self.x_ti**2
+
+        if inner_product_i > 0:
+            gamma_i = 1
+        else:
+            gamma_i = 0
+        
+        if self.T_i <= self.T_i_high:
+            beta_i = 1
+        elif self.T_i > self.T_i_high:
+            beta_i = 0
+
+        if self.T_i >= self.T_i_low + self.delta_i:
+            alpha_i = 1
+        elif self.T_i <= self.T_i_low + self.delta_i and self.T_i >= self.T_i_low:
+            alpha_i = 0.5 * (1 - np.cos(np.pi * (self.T_i - self.T_i_low) / self.delta_i))
+        else:
+            alpha_i = 0
+
+        activation_impedance = gamma_i + alpha_i * (1 - gamma_i)
+        Vd_star_mod = activation_impedance * Vd_star
+        dVd_star_mod = activation_impedance * dVd_star
+        ev_mod = Vb - Vd_star_mod
+        if self.save_tensorboard:
+            self.writer.add_scalars("activation_impedance",
+                            {"activation_impedance": activation_impedance}, self.golbal_steps)
+
+        # calculate next_step gd
+        Vd_mod = adjoint_g_ed(np.linalg.inv(g_ed)) @ Vd_star_mod
+        Vd_mod_hat = np.zeros((4,4))
+        Vd_mod_hat[:3,:3] = hat_map(Vd_mod[3:,0])
+        Vd_mod_hat[:3,3] = Vd_mod[:3,0]
+        self.gd = gd @ expm(Vd_mod_hat * self.dt)
+
+        Kd = self.Kd
+
+        energy_dissipation = (ev_mod.T @ Kd @ ev_mod)[0,0]
+        if energy_dissipation > 10:
+            energy_dissipation = 0.1
+
+        if self.iter % 100 == 0: #NOTE(JS) For the Debugging
+
+            # print(f"Sign of impedance inner product:{np.sign(inner_product_i)}, acitvation_impedance: {activation_impedance}")
+            # print(f"energy_dissipation:{energy_dissipation}" )
+            pass
+
+
+        dx_ti = (beta_i / self.x_ti) * (gamma_i * inner_product_i + energy_dissipation) \
+                + (alpha_i / self.x_ti) * (1 - gamma_i) * inner_product_i
+        
+        self.x_ti = self.x_ti + dx_ti * self.dt 
+
+        # GUFIC control law       
+
+        M_tilde_inv = Jb @ np.linalg.pinv(M) @ Jb.T
+        M_tilde = np.linalg.pinv(M_tilde_inv)
+
+        M_d = np.eye(6) * 10
+
+        Fe_raw = self.get_FT_value_raw().reshape((-1,1))
+        # print("Fe_raw : ", Fe_raw)
+        if self.inertia_shaping:
+            tau_tilde = M_tilde @ (dVd_star_mod + np.linalg.inv(M_d) @ (- Kd @ ev_mod - fg + F_f_mod + Fe_raw)) - Fe_raw 
+        else:
+            tau_tilde = M_tilde @ dVd_star_mod -Kd @ ev_mod - fg + F_f_mod
+
+        tau_cmd = Jb.T @ tau_tilde + qfrc_bias.reshape((-1,1))
+        # print("qfrc_bias : ", qfrc_bias)
+        ####### Save all the dummy variables
+        self.Fd_star_list.append(Fd_star)
+        self.Ff_list.append(F_f)
+        self.Vb_list.append(Vb)
+        self.Ff_activation.append(activation_force)
+        self.Fi_activation.append(activation_impedance)
+        self.rho_list.append(rho)
+
+        return tau_cmd.reshape((-1,))
+    
+    def set_hole_pose(self, pos, R):
+        set_body_pose_rotm(self.model, 'hole', pos, R)
+
+
+if __name__ == "__main__":
+    robot_name = 'indy7' 
+    show_viewer = True
+    randomized_start = True
+    inertia_shaping = False
+    episode_number = 50
+    
+    task = 'bolt'  # "regulation", 'circle', 'line'
+
+    assert task in ['regulation', 'circle', 'line', 'sphere', 'insertion', "bolt"]
+
+    save_dir = "/media/zhou/Elements SE/VLA/boltnut3_demos_vis_random_start"
+    pi0_save_dir = "/media/zhou/Elements SE/VLA/boltnut3_pi0_lerobot_random_start"
+    pi0_repo_id = "gufic_boltnut_pi0"
+    pi0_language = "insert the bolt into the hole"
+    save_pi0 = True
+    save_fm = False
+
+    if task == 'regulation':
+        max_time = 6
+    elif task == 'line':
+        max_time = 8
+    elif task == 'circle':
+        max_time = 10
+    elif task == 'sphere':
+        max_time = 10
+        fz = 10
+    elif task == 'insertion':
+        max_time = 6
+        fz = 5
+    elif task == 'bolt':
+        max_time = 12
+        fz = 5
+    else:
+        max_time = 6
+        fz = 5
+
+    save_tensorboard = True
+
+    RE = RobotEnv(robot_name, show_viewer = show_viewer, max_time = max_time, fz = fz, 
+                  fix_camera = True, task = task, randomized_start=randomized_start, 
+                  inertia_shaping = inertia_shaping, save_dir=save_dir,save_tensorboard=save_tensorboard,
+                  pi0_save_dir=pi0_save_dir, pi0_repo_id=pi0_repo_id, pi0_language=pi0_language)
+    
+    for episode in range(350, 400):
+        RE.reset()
+        RE.run()
+        success = RE.check_task_success()
+
+        if success:
+            if save_fm:
+                RE.demo_recorder.save(f"bolt_demo_{episode:04d}")
+            if save_pi0:
+                RE.save_pi0_episode()
+            print(f"[SAVE] episode {episode}")
+        else:
+            RE.clear_pi0_episode()
+            print(f"[DROP] episode {episode}")
+        RE.demo_recorder.reset()
+
+    if show_viewer:
+        RE.viewer.close()
