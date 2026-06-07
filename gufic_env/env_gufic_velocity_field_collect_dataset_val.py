@@ -22,7 +22,11 @@ from PIL import Image
 
 import matplotlib.pyplot as plt
 from recorder import BoltTrajectoryRecorder
-
+import os
+os.environ.setdefault(
+    "HF_DATASETS_CACHE",
+    "/media/zhou/软件/hf_datasets_cache",
+)
 
 def rotmat_to_rot6d_local(R):
     R = np.asarray(R, dtype=np.float32).reshape(3, 3)
@@ -49,13 +53,14 @@ class RobotEnv:
                  pi0_save_dir=None,
                  pi0_repo_id="gufic_bolt_pi0",
                  pi0_language="insert the bolt into the hole",
-                 pi0_fps=20):
+                 pi0_fps=20, save_fm=False, save_pi0=True):
         
         self.robot_name = robot_name
         self.task = task
         self.randomized_start = randomized_start
         self.inertia_shaping = inertia_shaping
-
+        self.save_fm=save_fm
+        self.save_pi0=save_pi0
         if observables is not None:
             self.observables = observables
         else:
@@ -266,7 +271,7 @@ class RobotEnv:
                     "meta/episodes.jsonl is missing, so no episode has been fully saved. "
                     "Please rename/delete this partial directory or collect into a new pi0_save_dir."
                 )
-            self.pi0_dataset = LeRobotDataset(self.pi0_repo_id, root=self.pi0_save_dir, local_files_only=True)
+            self.pi0_dataset = LeRobotDataset(self.pi0_repo_id, root=self.pi0_save_dir)
         else:
             self.pi0_dataset = LeRobotDataset.create(
                 repo_id=self.pi0_repo_id,
@@ -279,15 +284,15 @@ class RobotEnv:
                         "shape": (256, 256, 3),
                         "names": ["height", "width", "channels"],
                     },
-                    "observation.external_image": {
+                    "observation.image": {
                         "dtype": "image",
                         "shape": (256, 256, 3),
                         "names": ["height", "width", "channels"],
                     },
-                    "observation.robot_state": {
+                    "observation.state": {
                         "dtype": "float32",
                         "shape": (9,),
-                        "names": ["robot_state"],
+                        "names": ["state"],
                     },
                     "observation.force": {
                         "dtype": "float32",
@@ -352,8 +357,8 @@ class RobotEnv:
             return
 
         wrist_image = self.resize_rgb(self.get_camera_rgb(self.cam_id))
-        external_image = self.resize_rgb(self.get_external_rgb())
-        robot_state = np.concatenate(
+        image = self.resize_rgb(self.get_external_rgb())
+        state = np.concatenate(
             [
                 np.asarray(p, dtype=np.float32).reshape(3),
                 rotmat_to_rot6d_local(R),
@@ -364,8 +369,8 @@ class RobotEnv:
 
         frame = {
             "observation.wrist_image": wrist_image,
-            "observation.external_image": external_image,
-            "observation.robot_state": robot_state,
+            "observation.image": image,
+            "observation.state": state,
             "observation.force": np.asarray(Fe, dtype=np.float32).reshape(6),
             "action": action,
             "action.pd": np.asarray(pd, dtype=np.float32).reshape(3),
@@ -1009,29 +1014,30 @@ class RobotEnv:
             point_cloud = self.capture_point_cloud()
         else:
             point_cloud = None
-
-        self.demo_recorder.add(
-            t=self.iter * self.dt,
-            p=p,
-            R=R,
-            pd=self.rec_pd,
-            Rd=self.rec_Rd,
-            dpd=self.rec_dpd,
-            dRd=self.rec_dRd,
-            Vd_star=np.asarray(Vd_star).reshape(6),
-            dVd_star=np.asarray(dVd_star).reshape(6),
-            Fe=np.asarray(Fe).reshape(6),
-            point_cloud=point_cloud,
-        )
-        self.add_pi0_frame(
-            p=p,
-            R=R,
-            Fe=np.asarray(Fe).reshape(6),
-            pd=self.rec_pd,
-            Rd=self.rec_Rd,
-            dpd=self.rec_dpd,
-            dRd=self.rec_dRd,
-        )
+        if self.save_fm:
+            self.demo_recorder.add(
+                t=self.iter * self.dt,
+                p=p,
+                R=R,
+                pd=self.rec_pd,
+                Rd=self.rec_Rd,
+                dpd=self.rec_dpd,
+                dRd=self.rec_dRd,
+                Vd_star=np.asarray(Vd_star).reshape(6),
+                dVd_star=np.asarray(dVd_star).reshape(6),
+                Fe=np.asarray(Fe).reshape(6),
+                point_cloud=point_cloud,
+            )
+        if self.save_pi0:
+            self.add_pi0_frame(
+                p=p,
+                R=R,
+                Fe=np.asarray(Fe).reshape(6),
+                pd=self.rec_pd,
+                Rd=self.rec_Rd,
+                dpd=self.rec_dpd,
+                dRd=self.rec_dRd,
+            )
 
         gd_t = np.eye(4)
         gd_t[:3,:3] = self.Rd_t(t)
@@ -1264,14 +1270,14 @@ if __name__ == "__main__":
         max_time = 6
         fz = 5
 
-    save_tensorboard = True
+    save_tensorboard = False
 
     RE = RobotEnv(robot_name, show_viewer = show_viewer, max_time = max_time, fz = fz, 
                   fix_camera = True, task = task, randomized_start=randomized_start, 
                   inertia_shaping = inertia_shaping, save_dir=save_dir,save_tensorboard=save_tensorboard,
-                  pi0_save_dir=pi0_save_dir, pi0_repo_id=pi0_repo_id, pi0_language=pi0_language)
+                  pi0_save_dir=pi0_save_dir, pi0_repo_id=pi0_repo_id, pi0_language=pi0_language, save_fm=save_fm, save_pi0=save_pi0)
     
-    for episode in range(350, 400):
+    for episode in range(0, 50):
         RE.reset()
         RE.run()
         success = RE.check_task_success()
@@ -1279,13 +1285,13 @@ if __name__ == "__main__":
         if success:
             if save_fm:
                 RE.demo_recorder.save(f"bolt_demo_{episode:04d}")
+                RE.demo_recorder.reset()
             if save_pi0:
                 RE.save_pi0_episode()
             print(f"[SAVE] episode {episode}")
         else:
             RE.clear_pi0_episode()
             print(f"[DROP] episode {episode}")
-        RE.demo_recorder.reset()
 
     if show_viewer:
         RE.viewer.close()

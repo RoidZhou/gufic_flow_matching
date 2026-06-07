@@ -1,4 +1,5 @@
 import argparse
+import copy
 import types
 from pathlib import Path
 
@@ -128,14 +129,20 @@ def unpack_pi0_action(action):
     """
     action layout from env_gufic_velocity_field_collect_dataset_val.py:
         [pd(3), Rd6d(6), Vd_body(6)]
+    If the policy was trained with PI0_ACTION_MODE=pose, the action layout is:
+        [pd(3), Rd6d(6)]
+    and Vd_body is set to zero.
     """
     action = np.asarray(action, dtype=np.float32).reshape(-1)
-    if action.shape[0] < 15:
-        raise ValueError(f"pi0 action dim must be at least 15, got {action.shape[0]}")
+    if action.shape[0] < 9:
+        raise ValueError(f"pi0 action dim must be at least 9, got {action.shape[0]}")
 
     pd = action[:3].astype(np.float32)
     Rd6d = action[3:9].astype(np.float32)
-    Vd_body = action[9:15].astype(np.float32)
+    if action.shape[0] >= 15:
+        Vd_body = action[9:15].astype(np.float32)
+    else:
+        Vd_body = np.zeros(6, dtype=np.float32)
     Rd = rot6d_to_rotmat_np(Rd6d)
     dpd, dRd = vd_body_to_dpd_dRd(Vd_body, Rd)
     return pd, Rd, Vd_body, dpd, dRd
@@ -159,6 +166,7 @@ class PI0VelocityFieldInfer:
         device=None,
         zeta_v=50.0,
         zeta_w=10.0,
+        action_mode="pose",
     ):
         self.policy_path = Path(policy_path)
         self.dataset_repo_id = dataset_repo_id
@@ -167,6 +175,7 @@ class PI0VelocityFieldInfer:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.zeta_v = float(zeta_v)
         self.zeta_w = float(zeta_w)
+        self.action_mode = action_mode.lower()
 
         self.policy, self.state_key, self.force_key = self._load_policy()
         self.policy.to(self.device)
@@ -178,7 +187,9 @@ class PI0VelocityFieldInfer:
 
     def _load_policy(self):
         from lerobot.common.constants import OBS_STATE
+        from lerobot.common.datasets.utils import dataset_to_policy_features
         from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
+        from lerobot.configs.policies import PreTrainedConfig
         from lerobot.common.policies.pi0.modeling_pi0 import PI0Policy, pad_vector
         from lerobot.configs.types import FeatureType
 
@@ -186,9 +197,37 @@ class PI0VelocityFieldInfer:
             self.dataset_repo_id,
             root=self.dataset_root,
         )
+        features = copy.deepcopy(metadata.features)
+        stats = copy.deepcopy(metadata.stats)
+
+        if self.action_mode in ("pose", "pose_only", "no_vd_body", "no_vd"):
+            features["action"]["shape"] = (9,)
+            features["action"]["names"] = ["pd_Rd6d"]
+            if "action" in stats:
+                for stat_name, value in list(stats["action"].items()):
+                    if isinstance(value, torch.Tensor):
+                        stats["action"][stat_name] = value[:9].clone()
+                    else:
+                        stats["action"][stat_name] = value[:9].copy()
+        elif self.action_mode not in ("full", "pose_vd", "pose_vd_body", "with_vd_body"):
+            raise ValueError(
+                f"Unknown pi0 action mode {self.action_mode!r}. Use 'pose' or 'full'."
+            )
+
+        config = PreTrainedConfig.from_pretrained(str(self.policy_path))
+        policy_features = dataset_to_policy_features(features)
+        config.input_features = {
+            key: ft for key, ft in policy_features.items() if ft.type is not FeatureType.ACTION
+        }
+        config.output_features = {
+            key: ft for key, ft in policy_features.items() if ft.type is FeatureType.ACTION
+        }
+        config.device = self.device
+
         policy = PI0Policy.from_pretrained(
             str(self.policy_path),
-            dataset_stats=metadata.stats,
+            config=config,
+            dataset_stats=stats,
         )
 
         state_keys = [
@@ -332,6 +371,7 @@ def load_pi0_velocity_field_infer(
     device=None,
     zeta_v=50.0,
     zeta_w=10.0,
+    action_mode="pose",
 ):
     return PI0VelocityFieldInfer(
         policy_path=policy_path,
@@ -341,6 +381,7 @@ def load_pi0_velocity_field_infer(
         device=device,
         zeta_v=zeta_v,
         zeta_w=zeta_w,
+        action_mode=action_mode,
     )
 
 
@@ -418,6 +459,250 @@ def print_result(name, result):
         print("Vd_star:", result["Vd_star"])
 
 
+def rotation_geodesic_error_deg(R_pred, R_gt):
+    R_pred = np.asarray(R_pred, dtype=np.float32).reshape(-1, 3, 3)
+    R_gt = np.asarray(R_gt, dtype=np.float32).reshape(-1, 3, 3)
+    R_err = np.einsum("nij,njk->nik", np.transpose(R_pred, (0, 2, 1)), R_gt)
+    trace = np.trace(R_err, axis1=1, axis2=2)
+    cos_theta = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)
+    return np.arccos(cos_theta) * 180.0 / np.pi
+
+
+def plot_vector_comparison(pred, gt, labels, title, ylabel, save_path):
+    import matplotlib.pyplot as plt
+
+    pred = np.asarray(pred)
+    gt = np.asarray(gt)
+    step_idx = np.arange(len(pred))
+
+    fig, axes = plt.subplots(len(labels), 1, figsize=(12, 2.5 * len(labels)), sharex=True)
+    if len(labels) == 1:
+        axes = [axes]
+
+    for i, ax in enumerate(axes):
+        ax.plot(step_idx, pred[:, i], linewidth=1.4, label=f"pred_{labels[i]}")
+        ax.plot(step_idx, gt[:, i], linewidth=1.1, linestyle="--", label=f"gt_{labels[i]}")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best")
+
+    axes[0].set_title(title)
+    axes[-1].set_xlabel("sample index")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_scalar_error(values, title, ylabel, save_path):
+    import matplotlib.pyplot as plt
+
+    values = np.asarray(values)
+    fig, ax = plt.subplots(1, 1, figsize=(12, 3.5))
+    ax.plot(np.arange(len(values)), values, linewidth=1.4)
+    ax.set_title(title)
+    ax.set_xlabel("sample index")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_rotation_matrix_comparison(R_pred, R_gt, save_path):
+    import matplotlib.pyplot as plt
+
+    R_pred = np.asarray(R_pred)
+    R_gt = np.asarray(R_gt)
+    step_idx = np.arange(len(R_pred))
+
+    fig, axes = plt.subplots(3, 3, figsize=(14, 9), sharex=True)
+    for r in range(3):
+        for c in range(3):
+            ax = axes[r, c]
+            ax.plot(step_idx, R_pred[:, r, c], linewidth=1.2, label="pred")
+            ax.plot(step_idx, R_gt[:, r, c], linewidth=1.0, linestyle="--", label="gt")
+            ax.set_title(f"R[{r},{c}]")
+            ax.grid(True, alpha=0.3)
+            if r == 0 and c == 0:
+                ax.legend(loc="best")
+
+    fig.suptitle("Rd Matrix Comparison")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=160)
+    plt.close(fig)
+
+
+def save_comparison_plots(records, out_dir):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pd_pred = np.stack(records["pd_pred"], axis=0)
+    pd_gt = np.stack(records["pd_gt"], axis=0)
+    Rd_pred = np.stack(records["Rd_pred"], axis=0)
+    Rd_gt = np.stack(records["Rd_gt"], axis=0)
+    Vd_body_pred = np.stack(records["Vd_body_pred"], axis=0)
+    Vd_body_gt = np.stack(records["Vd_body_gt"], axis=0)
+    Vd_star_pred = np.stack(records["Vd_star_pred"], axis=0)
+    Vd_star_gt = np.stack(records["Vd_star_gt"], axis=0)
+
+    plot_vector_comparison(
+        pd_pred,
+        pd_gt,
+        labels=["x", "y", "z"],
+        title="Desired Position pd",
+        ylabel="m",
+        save_path=out_dir / "pd_comparison.png",
+    )
+    plot_rotation_matrix_comparison(
+        Rd_pred,
+        Rd_gt,
+        save_path=out_dir / "Rd_matrix_comparison.png",
+    )
+    plot_vector_comparison(
+        Vd_body_pred,
+        Vd_body_gt,
+        labels=["vx", "vy", "vz", "wx", "wy", "wz"],
+        title="Desired Body Velocity Vd_body",
+        ylabel="m/s, rad/s",
+        save_path=out_dir / "Vd_body_comparison.png",
+    )
+    plot_vector_comparison(
+        Vd_star_pred,
+        Vd_star_gt,
+        labels=["vx", "vy", "vz", "wx", "wy", "wz"],
+        title="Final GUFIC Velocity Field Vd_star",
+        ylabel="m/s, rad/s",
+        save_path=out_dir / "Vd_star_comparison.png",
+    )
+
+    pd_err = np.linalg.norm(pd_pred - pd_gt, axis=1)
+    rot_err = rotation_geodesic_error_deg(Rd_pred, Rd_gt)
+    Vd_body_err = np.linalg.norm(Vd_body_pred - Vd_body_gt, axis=1)
+    Vd_star_err = np.linalg.norm(Vd_star_pred - Vd_star_gt, axis=1)
+
+    plot_scalar_error(pd_err, "pd Error Norm", "m", out_dir / "pd_error_norm.png")
+    plot_scalar_error(rot_err, "Rd Geodesic Error", "deg", out_dir / "Rd_error_deg.png")
+    plot_scalar_error(Vd_body_err, "Vd_body Error Norm", "m/s, rad/s", out_dir / "Vd_body_error_norm.png")
+    plot_scalar_error(Vd_star_err, "Vd_star Error Norm", "m/s, rad/s", out_dir / "Vd_star_error_norm.png")
+
+    np.savez_compressed(
+        out_dir / "pi0_comparison_arrays.npz",
+        pd_pred=pd_pred,
+        pd_gt=pd_gt,
+        Rd_pred=Rd_pred,
+        Rd_gt=Rd_gt,
+        Vd_body_pred=Vd_body_pred,
+        Vd_body_gt=Vd_body_gt,
+        Vd_star_pred=Vd_star_pred,
+        Vd_star_gt=Vd_star_gt,
+        pd_err=pd_err,
+        rot_err_deg=rot_err,
+        Vd_body_err=Vd_body_err,
+        Vd_star_err=Vd_star_err,
+        frame_indices=np.asarray(records["frame_indices"], dtype=np.int64),
+    )
+
+    print(f"\nSaved comparison plots to: {out_dir}")
+    print(f"pd_err mean/max: {pd_err.mean():.6f} / {pd_err.max():.6f} m")
+    print(f"Rd_err mean/max: {rot_err.mean():.6f} / {rot_err.max():.6f} deg")
+    print(f"Vd_body_err mean/max: {Vd_body_err.mean():.6f} / {Vd_body_err.max():.6f}")
+    print(f"Vd_star_err mean/max: {Vd_star_err.mean():.6f} / {Vd_star_err.max():.6f}")
+
+
+def run_dataset_comparison(
+    policy_path,
+    dataset_repo_id,
+    dataset_root,
+    out_dir,
+    start_index=0,
+    max_frames=1000,
+    stride=1,
+    language="insert the bolt into the hole",
+    device=None,
+    zeta_v=50.0,
+    zeta_w=10.0,
+    action_mode="pose",
+    reset_each_frame=True,
+):
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+    dataset = LeRobotDataset(dataset_repo_id, root=dataset_root)
+    pi0_infer = load_pi0_velocity_field_infer(
+        policy_path=policy_path,
+        dataset_repo_id=dataset_repo_id,
+        dataset_root=dataset_root,
+        language=language,
+        device=device,
+        zeta_v=zeta_v,
+        zeta_w=zeta_w,
+        action_mode=action_mode,
+    )
+
+    end_index = len(dataset) if max_frames is None else min(len(dataset), start_index + max_frames * stride)
+    frame_indices = list(range(int(start_index), int(end_index), int(stride)))
+
+    records = {
+        "frame_indices": [],
+        "pd_pred": [],
+        "pd_gt": [],
+        "Rd_pred": [],
+        "Rd_gt": [],
+        "Vd_body_pred": [],
+        "Vd_body_gt": [],
+        "Vd_star_pred": [],
+        "Vd_star_gt": [],
+    }
+
+    for n, frame_index in enumerate(frame_indices):
+        sample = dataset[frame_index]
+        if "action" not in sample:
+            raise KeyError("Dataset sample has no action, cannot draw pred/gt comparison.")
+
+        wrist_image, external_image, p, R, Fe = sample_to_pi0_inputs(sample)
+
+        if reset_each_frame:
+            pi0_infer.reset()
+
+        pred = pi0_infer.predict_velocity_field(
+            wrist_image=wrist_image,
+            external_image=external_image,
+            p=p,
+            R=R,
+            Fe=Fe,
+        )
+
+        action_gt = to_numpy(sample["action"]).astype(np.float32).reshape(-1)
+        pd_gt, Rd_gt, Vd_body_gt, dpd_gt, dRd_gt = unpack_pi0_action(action_gt)
+        g = np.eye(4, dtype=np.float32)
+        g[:3, :3] = R
+        g[:3, 3] = p
+        Vd_star_gt = get_velocity_field(
+            g=g,
+            pd=pd_gt,
+            Rd=Rd_gt,
+            dpd=dpd_gt,
+            dRd=dRd_gt,
+            zeta_v=zeta_v,
+            zeta_w=zeta_w,
+        )
+
+        records["frame_indices"].append(frame_index)
+        records["pd_pred"].append(pred["pd"])
+        records["pd_gt"].append(pd_gt)
+        records["Rd_pred"].append(pred["Rd"])
+        records["Rd_gt"].append(Rd_gt)
+        records["Vd_body_pred"].append(pred["Vd_body"])
+        records["Vd_body_gt"].append(Vd_body_gt)
+        records["Vd_star_pred"].append(pred["Vd_star"])
+        records["Vd_star_gt"].append(Vd_star_gt)
+
+        if n % 50 == 0:
+            print(f"[{n + 1}/{len(frame_indices)}] frame={frame_index}")
+
+    save_comparison_plots(records, out_dir)
+    return records
+
+
 def run_one_dataset_frame(
     policy_path,
     dataset_repo_id,
@@ -428,6 +713,7 @@ def run_one_dataset_frame(
     zeta_v=50.0,
     zeta_w=10.0,
     save_npz=None,
+    action_mode="pose",
 ):
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
@@ -443,6 +729,7 @@ def run_one_dataset_frame(
         device=device,
         zeta_v=zeta_v,
         zeta_w=zeta_w,
+        action_mode=action_mode,
     )
     result = pi0_infer.predict_velocity_field(
         wrist_image=wrist_image,
@@ -519,8 +806,7 @@ def parse_args():
     )
     parser.add_argument(
         "--policy_path",
-        required=True,
-        help="Path to pi0 pretrained_model directory, e.g. checkpoints/last/pretrained_model.",
+        default="/media/zhou/Elements SE/VLA/checkpoints_pi0/checkpoints/001000/pretrained_model",
     )
     parser.add_argument(
         "--dataset_root",
@@ -533,23 +819,65 @@ def parse_args():
     parser.add_argument("--device", default=None)
     parser.add_argument("--zeta_v", type=float, default=50.0)
     parser.add_argument("--zeta_w", type=float, default=10.0)
+    parser.add_argument(
+        "--action_mode",
+        default="pose",
+        choices=["pose", "full"],
+        help="Use 'pose' for [pd,Rd6d] checkpoints, or 'full' for [pd,Rd6d,Vd_body].",
+    )
     parser.add_argument("--save_npz", default=None)
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Run multi-frame dataset comparison and save plots instead of only printing one frame.",
+    )
+    parser.add_argument(
+        "--out_dir",
+        default="./infer_pi0_compare",
+        help="Output directory for --compare plots.",
+    )
+    parser.add_argument("--start_index", type=int, default=0)
+    parser.add_argument("--max_frames", type=int, default=1000)
+    parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument(
+        "--keep_action_queue",
+        action="store_true",
+        help="Keep pi0 action queue across frames. Default resets every frame for fair one-step pred/gt plots.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    run_one_dataset_frame(
-        policy_path=args.policy_path,
-        dataset_repo_id=args.dataset_repo_id,
-        dataset_root=args.dataset_root,
-        frame_index=args.frame_index,
-        language=args.language,
-        device=args.device,
-        zeta_v=args.zeta_v,
-        zeta_w=args.zeta_w,
-        save_npz=args.save_npz,
-    )
+    if args.compare:
+        run_dataset_comparison(
+            policy_path=args.policy_path,
+            dataset_repo_id=args.dataset_repo_id,
+            dataset_root=args.dataset_root,
+            out_dir=args.out_dir,
+            start_index=args.start_index,
+            max_frames=args.max_frames,
+            stride=args.stride,
+            language=args.language,
+            device=args.device,
+            zeta_v=args.zeta_v,
+            zeta_w=args.zeta_w,
+            action_mode=args.action_mode,
+            reset_each_frame=not args.keep_action_queue,
+        )
+    else:
+        run_one_dataset_frame(
+            policy_path=args.policy_path,
+            dataset_repo_id=args.dataset_repo_id,
+            dataset_root=args.dataset_root,
+            frame_index=args.frame_index,
+            language=args.language,
+            device=args.device,
+            zeta_v=args.zeta_v,
+            zeta_w=args.zeta_w,
+            save_npz=args.save_npz,
+            action_mode=args.action_mode,
+        )
 
 
 if __name__ == "__main__":

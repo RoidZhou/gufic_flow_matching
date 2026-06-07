@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 import logging
+import copy
+import os
 import sys
 import time
 from contextlib import nullcontext
@@ -46,10 +48,16 @@ except ModuleNotFoundError:
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("pi0_boltnut.yaml")
+DEFAULT_SMOLVLA_CONFIG_PATH = Path(__file__).with_name("smolvla_boltnut.yaml")
 DEFAULT_PI0_PATH = (
     "/home/zhou/.cache/huggingface/hub/"
     "models--lerobot--pi0/snapshots/e4ed526af508e58f6008b29e9e48f1098278fdb5"
 )
+DEFAULT_VLA_ACTION_MODE = "pose"  # "pose": [pd, Rd6d], "full": [pd, Rd6d, Vd_body]
+DEFAULT_VLA_FRAME_STRIDE = 4
+# Backward-compatible env names used by the earlier pi0-only training path.
+DEFAULT_PI0_ACTION_MODE = DEFAULT_VLA_ACTION_MODE
+DEFAULT_PI0_FRAME_STRIDE = DEFAULT_VLA_FRAME_STRIDE
 
 
 def maybe_set_pretrained_path(cfg: TrainPipelineConfig) -> None:
@@ -57,6 +65,35 @@ def maybe_set_pretrained_path(cfg: TrainPipelineConfig) -> None:
         cfg.policy.pretrained_path = DEFAULT_PI0_PATH
     elif cfg.policy.type == "smolvla" and not getattr(cfg.policy, "pretrained_path", None):
         cfg.policy.pretrained_path = "lerobot/smolvla_base"
+
+
+def get_default_config_path() -> Path:
+    """Select a default config when --config_path is omitted.
+
+    Examples:
+        VLA_CONFIG=pi0      -> pi0_boltnut.yaml
+        VLA_CONFIG=smolvla  -> smolvla_boltnut.yaml
+        VLA_CONFIG=/path/to/custom.yaml -> that yaml
+    """
+    config_name = (
+        os.environ.get("VLA_CONFIG")
+        or os.environ.get("VLA_POLICY_TYPE")
+        or os.environ.get("VLA_POLICY")
+        or "pi0"
+    )
+    normalized = config_name.lower().replace("-", "_")
+    if normalized in ("pi0", "pi_0"):
+        return DEFAULT_CONFIG_PATH
+    if normalized in ("smolvla", "smol_vla", "smooth_vla", "smoth_vla"):
+        return DEFAULT_SMOLVLA_CONFIG_PATH
+
+    config_path = Path(config_name)
+    if config_path.suffix in (".yaml", ".yml"):
+        return config_path
+    raise ValueError(
+        "Unknown VLA_CONFIG "
+        f"{config_name!r}. Use 'pi0', 'smolvla', or a yaml path."
+    )
 
 
 def log_runtime_paths() -> None:
@@ -101,6 +138,177 @@ def validate_dataset_root(cfg: TrainPipelineConfig) -> None:
             "but save_episode() was not executed successfully. Re-collect into a new "
             "dataset directory, or remove/rename this partial directory before collecting."
         )
+
+
+class ActionModeDataset(torch.utils.data.Dataset):
+    """Wrap a LeRobotDataset and optionally reduce batch['action'] dimensions."""
+
+    def __init__(self, dataset, action_mode="full"):
+        self.dataset = dataset
+        self.action_mode = action_mode
+        self.meta = dataset.meta
+        self.episode_data_index = dataset.episode_data_index
+        self.episodes = getattr(dataset, "episodes", None)
+        self._patch_meta_for_action_mode()
+
+    def _action_slice(self):
+        if self.action_mode in ("full", "pose_vd", "pose_vd_body", "with_vd_body"):
+            return slice(0, 15)
+        if self.action_mode in ("pose", "pose_only", "no_vd_body", "no_vd"):
+            return slice(0, 9)
+        raise ValueError(
+            "Unknown VLA action mode "
+            f"{self.action_mode!r}. Use 'full' or 'pose'."
+        )
+
+    def _patch_stat(self, stats, key, action_slice):
+        if key not in stats:
+            return
+        for stat_name, value in list(stats[key].items()):
+            if isinstance(value, torch.Tensor):
+                stats[key][stat_name] = value[action_slice].clone()
+            else:
+                stats[key][stat_name] = value[action_slice].copy()
+
+    def _patch_meta_for_action_mode(self):
+        action_slice = self._action_slice()
+        action_dim = action_slice.stop - action_slice.start
+        if action_dim == 15:
+            return
+
+        # Avoid mutating nested dicts shared with the original dataset object.
+        self.meta.info["features"] = copy.deepcopy(self.meta.features)
+        self.meta.stats = copy.deepcopy(self.meta.stats)
+        self.meta.episodes_stats = copy.deepcopy(self.meta.episodes_stats)
+
+        self.meta.features["action"]["shape"] = (action_dim,)
+        self.meta.features["action"]["names"] = ["pd_Rd6d"] if action_dim == 9 else ["action"]
+
+        self._patch_stat(self.meta.stats, "action", action_slice)
+        for ep_stats in self.meta.episodes_stats.values():
+            self._patch_stat(ep_stats, "action", action_slice)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        item = self.dataset[index]
+        action_slice = self._action_slice()
+        if "action" in item:
+            item["action"] = item["action"][..., action_slice]
+        return item
+
+    @property
+    def num_frames(self):
+        return self.dataset.num_frames
+
+    @property
+    def num_episodes(self):
+        return self.dataset.num_episodes
+
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+
+
+class StridedDataset(torch.utils.data.Dataset):
+    """Use one training sample every `stride` frames, preserving episode boundaries."""
+
+    def __init__(self, dataset, stride=1):
+        self.dataset = dataset
+        self.stride = int(stride)
+        if self.stride < 1:
+            raise ValueError(f"frame stride must be >= 1, got {self.stride}")
+
+        self.meta = dataset.meta
+        self.episodes = getattr(dataset, "episodes", None)
+        self.index_map, self.episode_data_index = self._build_index_map()
+
+    def _build_index_map(self):
+        old_index = self.dataset.episode_data_index
+        mapped_indices = []
+        new_from = []
+        new_to = []
+
+        cursor = 0
+        for start, stop in zip(old_index["from"].tolist(), old_index["to"].tolist()):
+            ep_indices = list(range(start, stop, self.stride))
+            new_from.append(cursor)
+            cursor += len(ep_indices)
+            new_to.append(cursor)
+            mapped_indices.extend(ep_indices)
+
+        return (
+            torch.as_tensor(mapped_indices, dtype=torch.long),
+            {
+                "from": torch.as_tensor(new_from, dtype=torch.long),
+                "to": torch.as_tensor(new_to, dtype=torch.long),
+            },
+        )
+
+    def __len__(self):
+        return int(self.index_map.numel())
+
+    def __getitem__(self, index):
+        source_index = int(self.index_map[int(index)].item())
+        return self.dataset[source_index]
+
+    @property
+    def num_frames(self):
+        return len(self)
+
+    @property
+    def num_episodes(self):
+        return self.dataset.num_episodes
+
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+
+
+def get_vla_action_mode(cfg: TrainPipelineConfig) -> str:
+    return (
+        get_cfg_attr(cfg, "vla_action_mode", None)
+        or os.environ.get("VLA_ACTION_MODE")
+        or get_cfg_attr(cfg, "pi0_action_mode", None)
+        or os.environ.get("PI0_ACTION_MODE", DEFAULT_PI0_ACTION_MODE)
+    ).lower()
+
+
+def get_vla_frame_stride(cfg: TrainPipelineConfig) -> int:
+    return int(
+        get_cfg_attr(cfg, "vla_frame_stride", None)
+        or os.environ.get("VLA_FRAME_STRIDE")
+        or get_cfg_attr(cfg, "pi0_frame_stride", None)
+        or os.environ.get("PI0_FRAME_STRIDE", DEFAULT_PI0_FRAME_STRIDE)
+    )
+
+
+def maybe_wrap_action_mode_dataset(dataset, cfg: TrainPipelineConfig):
+    policy_type = getattr(cfg.policy, "type", "vla")
+    if policy_type not in ("pi0", "smolvla"):
+        return dataset
+
+    action_mode = get_vla_action_mode(cfg)
+    if action_mode in ("full", "pose_vd", "pose_vd_body", "with_vd_body"):
+        logging.info(f"{policy_type} action mode: full [pd, Rd6d, Vd_body] (15 dims)")
+        return dataset
+
+    wrapped = ActionModeDataset(dataset, action_mode=action_mode)
+    logging.info(f"{policy_type} action mode: pose only [pd, Rd6d] (9 dims)")
+    return wrapped
+
+
+def maybe_wrap_frame_stride_dataset(dataset, cfg: TrainPipelineConfig):
+    frame_stride = get_vla_frame_stride(cfg)
+    if frame_stride <= 1:
+        logging.info("VLA frame stride: 1 (use every frame)")
+        return dataset
+
+    wrapped = StridedDataset(dataset, stride=frame_stride)
+    logging.info(
+        "VLA frame stride: "
+        f"{frame_stride} ({dataset.num_frames} -> {wrapped.num_frames} frames)"
+    )
+    return wrapped
 
 
 def make_optimizer_and_scheduler_compat(cfg: TrainPipelineConfig, policy: PreTrainedPolicy):
@@ -193,6 +401,8 @@ def train(cfg: TrainPipelineConfig):
     logging.info("Creating dataset")
     validate_dataset_root(cfg)
     dataset = make_dataset(cfg)
+    dataset = maybe_wrap_action_mode_dataset(dataset, cfg)
+    dataset = maybe_wrap_frame_stride_dataset(dataset, cfg)
 
     eval_env = None
     if cfg.eval_freq > 0 and cfg.env is not None:
@@ -349,5 +559,5 @@ def train(cfg: TrainPipelineConfig):
 if __name__ == "__main__":
     init_logging()
     if "--config_path" not in sys.argv:
-        sys.argv.extend(["--config_path", str(DEFAULT_CONFIG_PATH)])
+        sys.argv.extend(["--config_path", str(get_default_config_path())])
     train()
