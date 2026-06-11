@@ -497,15 +497,20 @@ class RollingForceHistoryFMDataset(Dataset):
                     m = 0
                     p_d = pd[min(k + m, T - 1)].astype(np.float32)
                     R_d = Rd[min(k + m, T - 1)].astype(np.float32)
-                    delta_pose_target = build_delta_pose_target(p_now, R_now, p_d, R_d)  # [9]
+                    R_d6d = rotmat_to_rot6d_one(R_d)
+
+                    desired_pose_target = np.concatenate(
+                        [p_d.astype(np.float32), R_d6d.astype(np.float32)],
+                        axis=0,
+                    ).astype(np.float32)  # [9] = pd(3) + Rd6d(6)
+
                     Vd_body_future = Vd_body[k : k + pred_horizon]
 
-                    all_delta_p.append(delta_pose_target[:3][None, :])   # [1,3]
-                    all_delta_R.append(delta_pose_target[3:][None, :])   # [1,6]
+                    all_delta_p.append(desired_pose_target[:3][None, :])
+                    all_delta_R.append(desired_pose_target[3:][None, :])
+
                     self.samples.append({
-                        # "p_now_raw": p_now,
-                        # "R6d_now_raw": R6d_now,
-                        "delta_pose_target": delta_pose_target,
+                        "desired_pose_target": desired_pose_target,
                         "p_hist_raw": p_hist,
                         "R_hist_raw": R_hist,
                         "pc_hist_raw": pc_hist,
@@ -562,16 +567,14 @@ class RollingForceHistoryFMDataset(Dataset):
                 v_std = all_v_cat.std(axis=0, keepdims=True).astype(np.float32)
                 v_std = np.clip(v_std, eps, None)
             all_delta_p_cat = np.concatenate(all_delta_p, axis=0)   # [num_samples, 3]
-            delta_p_mean = all_delta_p_cat.mean(axis=0, keepdims=True).astype(np.float32)
-            delta_p_std = all_delta_p_cat.std(axis=0, keepdims=True).astype(np.float32)
-            print("delta_p_std =", delta_p_std)
-            delta_p_std = np.clip(delta_p_std,  5e-4, None)
+            desired_p_mean = all_delta_p_cat.mean(axis=0, keepdims=True).astype(np.float32)
+            desired_p_std = all_delta_p_cat.std(axis=0, keepdims=True).astype(np.float32)
+            desired_p_std = np.clip(desired_p_std, 5e-4, None)
 
             all_delta_R_cat = np.concatenate(all_delta_R, axis=0)   # [num_samples, 6]
-            delta_R_mean = all_delta_R_cat.mean(axis=0, keepdims=True).astype(np.float32)
-            delta_R_std = all_delta_R_cat.std(axis=0, keepdims=True).astype(np.float32)
-            print("delta_R_std =", delta_R_std)
-            delta_R_std = np.clip(delta_R_std, 1e-3, None)
+            desired_R_mean = all_delta_R_cat.mean(axis=0, keepdims=True).astype(np.float32)
+            desired_R_std = all_delta_R_cat.std(axis=0, keepdims=True).astype(np.float32)
+            desired_R_std = np.clip(desired_R_std, 2e-2, None)
 
             if self.separation_vp:
                 self.cond_stats = {
@@ -583,10 +586,10 @@ class RollingForceHistoryFMDataset(Dataset):
                     "fe_std": fe_std,
                     "vd_mean": vd_mean,
                     "vd_std": vd_std,
-                    "delta_p_mean": delta_p_mean,
-                    "delta_p_std": delta_p_std,
-                    "delta_R_mean": delta_R_mean,
-                    "delta_R_std": delta_R_std,
+                    "desired_p_mean": desired_p_mean,
+                    "desired_p_std": desired_p_std,
+                    "desired_R_mean": desired_R_mean,
+                    "desired_R_std": desired_R_std,
                 }
             else:
                 self.cond_stats = {
@@ -598,10 +601,10 @@ class RollingForceHistoryFMDataset(Dataset):
                     "fe_std": fe_std,
                     "v_mean": v_mean,
                     "v_std": v_std,
-                    "delta_p_mean": delta_p_mean,
-                    "delta_p_std": delta_p_std,
-                    "delta_R_mean": delta_R_mean,
-                    "delta_R_std": delta_R_std,
+                    "desired_p_mean": cond_stats["desired_p_mean"].astype(np.float32),
+                    "desired_p_std": np.clip(cond_stats["desired_p_std"].astype(np.float32), 5e-4, None),
+                    "desired_R_mean": cond_stats["desired_R_mean"].astype(np.float32),
+                    "desired_R_std": np.clip(cond_stats["desired_R_std"].astype(np.float32), 2e-2, None),
                 }
         else:
             if self.separation_vp:
@@ -614,10 +617,10 @@ class RollingForceHistoryFMDataset(Dataset):
                     "fe_std": np.clip(cond_stats["fe_std"].astype(np.float32), eps, None),
                     "vd_mean": cond_stats["vd_mean"].astype(np.float32),
                     "vd_std": np.clip(cond_stats["vd_std"].astype(np.float32), eps, None),
-                    "delta_p_mean": cond_stats["delta_p_mean"].astype(np.float32),
-                    "delta_p_std": np.clip(cond_stats["delta_p_std"].astype(np.float32), eps, None),
-                    "delta_R_mean": cond_stats["delta_R_mean"].astype(np.float32),
-                    "delta_R_std": np.clip(cond_stats["delta_R_std"].astype(np.float32), eps, None),
+                    "desired_p_mean": cond_stats["desired_p_mean"].astype(np.float32),
+                    "desired_p_std": np.clip(cond_stats["desired_p_std"].astype(np.float32), 5e-4, None),
+                    "desired_R_mean": cond_stats["desired_R_mean"].astype(np.float32),
+                    "desired_R_std": np.clip(cond_stats["desired_R_std"].astype(np.float32), 2e-2, None),
                 }
             else:
                 self.cond_stats = {
@@ -632,7 +635,7 @@ class RollingForceHistoryFMDataset(Dataset):
                     "delta_p_mean": cond_stats["delta_p_mean"].astype(np.float32),
                     "delta_p_std": np.clip(cond_stats["delta_p_std"].astype(np.float32), eps, None),
                     "delta_R_mean": cond_stats["delta_R_mean"].astype(np.float32),
-                    "delta_R_std": np.clip(cond_stats["delta_R_std"].astype(np.float32), eps, None),
+                    "delta_R_std": np.clip(cond_stats["delta_R_std"].astype(np.float32), 2e-2, None),
                 }
 
         for s in self.samples:
@@ -655,21 +658,24 @@ class RollingForceHistoryFMDataset(Dataset):
                         (s["v_future_raw"] - self.cond_stats["v_mean"]) / self.cond_stats["v_std"]
                     ).astype(np.float32)
                 pc_raw = s["pc_hist_raw"].astype(np.float32)
-                s["pc_hist"] = (pc_raw / self.pc_scale).astype(np.float32)
+                s["pc_hist"] = pc_raw.astype(np.float32)
 
-                delta_p_raw = s["delta_pose_target"][:3].astype(np.float32)[None, :]
-                delta_R_raw = s["delta_pose_target"][3:].astype(np.float32)[None, :]
+                desired_p_raw = s["desired_pose_target"][:3].astype(np.float32)[None, :]
+                desired_R_raw = s["desired_pose_target"][3:].astype(np.float32)[None, :]
 
-                delta_p = (
-                    (delta_p_raw - self.cond_stats["delta_p_mean"]) / self.cond_stats["delta_p_std"]
-                ).astype(np.float32)
-                delta_R = (
-                    (delta_R_raw - self.cond_stats["delta_R_mean"]) / self.cond_stats["delta_R_std"]
+                desired_p = (
+                    (desired_p_raw - self.cond_stats["desired_p_mean"])
+                    / self.cond_stats["desired_p_std"]
                 ).astype(np.float32)
 
-                s["delta_pose_target_norm"] = np.concatenate(
-                    [delta_p.reshape(-1), delta_R.reshape(-1)],
-                    axis=0
+                desired_R = (
+                    (desired_R_raw - self.cond_stats["desired_R_mean"])
+                    / self.cond_stats["desired_R_std"]
+                ).astype(np.float32)
+
+                s["desired_pose_target_norm"] = np.concatenate(
+                    [desired_p.reshape(-1), desired_R.reshape(-1)],
+                    axis=0,
                 ).astype(np.float32)
 
             else:
@@ -707,7 +713,7 @@ class RollingForceHistoryFMDataset(Dataset):
                 torch.from_numpy(cond_hist.astype(np.float32)),   # [6K]
                 torch.from_numpy(x_now.astype(np.float32)),   # [6K]
                 torch.from_numpy(s["pc_hist"].astype(np.float32)),  # [H,6]
-                torch.from_numpy(s["delta_pose_target_norm"].astype(np.float32)),
+                torch.from_numpy(s["desired_pose_target_norm"].astype(np.float32)),
                 torch.from_numpy(s["Vd_body_future"].astype(np.float32)),  # [H,6]
             )
         else:

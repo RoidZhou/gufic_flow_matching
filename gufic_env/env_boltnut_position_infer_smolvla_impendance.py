@@ -12,14 +12,6 @@ from PIL import Image
 from scipy.spatial.transform import Rotation as RT
 
 try:
-    from torch.utils.tensorboard import SummaryWriter
-except Exception:
-    try:
-        from tensorboardX import SummaryWriter
-    except Exception:
-        SummaryWriter = None
-
-try:
     import mujoco
     import mujoco.viewer
 except Exception as exc:
@@ -148,6 +140,14 @@ def pose_to_xyzrpy(p, R):
     return np.concatenate([p, euler.astype(np.float32)], axis=0).astype(np.float32)
 
 
+def vee_map(R):
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    v3 = -R[0, 1]
+    v1 = -R[1, 2]
+    v2 = R[0, 2]
+    return np.array([v1, v2, v3], dtype=np.float64).reshape(3, 1)
+
+
 class SmolVLAJointPositionInfer:
     """SmolVLA inference for datasets with action=[q1..q6, gripper]."""
 
@@ -272,7 +272,7 @@ class SmolVLAJointPositionInfer:
 
 
 class BoltNutPositionSmolVLAEnv(RobotEnv):
-    """Online SmolVLA position-control deployment for action=[q1..q6, gripper]."""
+    """Online SmolVLA joint-position policy with task-space impedance execution."""
 
     def __init__(
         self,
@@ -286,8 +286,26 @@ class BoltNutPositionSmolVLAEnv(RobotEnv):
         q_cmd_startup_max_delta=0.002,
         q_cmd_startup_steps=1000,
         action_lowpass_alpha=1.0,
-        save_tensorboard=False,
-        tensorboard_logdir="./gufic/tb_pose_smolvla",
+        free_impedance_kp=(2500.0, 2500.0, 1200.0),
+        free_impedance_kr=(1000.0, 1000.0, 1000.0),
+        free_impedance_damping_scale=8.0,
+        free_tau_limit=1000.0,
+        contact_impedance_kp=(500.0, 500.0, 80.0),
+        contact_impedance_kr=(250.0, 250.0, 250.0),
+        contact_impedance_damping_scale=6.0,
+        contact_tau_limit=300.0,
+        free_control_mode="joint_pd",
+        free_joint_kp=(3000.0, 8000.0, 8000.0, 8000.0, 5000.0, 1000.0),
+        free_joint_damping_scale=2.0,
+        free_joint_tau_limit=8000.0,
+        use_contact_force_tracking=True,
+        contact_force_target=(0.0, 0.0, -10.0, 0.0, 0.0, 0.0),
+        contact_force_kp=(0.0, 0.0, 1.0, 0.0, 0.0, 0.0),
+        contact_force_ki=(0.0, 0.0, 4.0, 0.0, 0.0, 0.0),
+        contact_force_kd=(0.0, 0.0, 0.02, 0.0, 0.0, 0.0),
+        contact_force_int_limit=20.0,
+        contact_force_output_limit=80.0,
+        contact_force_sign=1.0,
         device=None,
         **kwargs,
     ):
@@ -310,22 +328,43 @@ class BoltNutPositionSmolVLAEnv(RobotEnv):
         self.q_cmd_startup_max_delta = float(q_cmd_startup_max_delta)
         self.q_cmd_startup_steps = int(q_cmd_startup_steps)
         self.action_lowpass_alpha = float(action_lowpass_alpha)
-        self.save_pose_tensorboard = bool(save_tensorboard)
-        self.tensorboard_logdir = str(tensorboard_logdir)
-        self.tb_writer = None
-        if self.save_pose_tensorboard:
-            if SummaryWriter is None:
-                raise ImportError("TensorBoard is not available. Install tensorboard or tensorboardX.")
-            self.tb_writer = SummaryWriter(self.tensorboard_logdir)
+        self.free_impedance_Kp = np.diag(np.asarray(free_impedance_kp, dtype=np.float64).reshape(3))
+        self.free_impedance_KR = np.diag(np.asarray(free_impedance_kr, dtype=np.float64).reshape(3))
+        self.free_impedance_damping_scale = float(free_impedance_damping_scale)
+        self.free_tau_limit = float(free_tau_limit)
+        self.contact_impedance_Kp = np.diag(np.asarray(contact_impedance_kp, dtype=np.float64).reshape(3))
+        self.contact_impedance_KR = np.diag(np.asarray(contact_impedance_kr, dtype=np.float64).reshape(3))
+        self.contact_impedance_damping_scale = float(contact_impedance_damping_scale)
+        self.contact_tau_limit = float(contact_tau_limit)
+        if free_control_mode not in ("joint_pd", "task_impedance"):
+            raise ValueError(f"Unsupported free_control_mode: {free_control_mode}")
+        self.free_control_mode = free_control_mode
+        self.free_joint_Kp = np.diag(np.asarray(free_joint_kp, dtype=np.float64).reshape(self.robot_state.N))
+        free_joint_kd = np.sqrt(np.maximum(np.diag(self.free_joint_Kp), 0.0)) * float(free_joint_damping_scale)
+        self.free_joint_Kd = np.diag(free_joint_kd)
+        self.free_joint_tau_limit = float(free_joint_tau_limit)
+        self.use_contact_force_tracking = bool(use_contact_force_tracking)
+        self.contact_force_target = np.asarray(contact_force_target, dtype=np.float64).reshape(6, 1)
+        self.contact_force_Kp = np.diag(np.asarray(contact_force_kp, dtype=np.float64).reshape(6))
+        self.contact_force_Ki = np.diag(np.asarray(contact_force_ki, dtype=np.float64).reshape(6))
+        self.contact_force_Kd = np.diag(np.asarray(contact_force_kd, dtype=np.float64).reshape(6))
+        self.contact_force_int_limit = float(contact_force_int_limit)
+        self.contact_force_output_limit = float(contact_force_output_limit)
+        self.contact_force_sign = float(contact_force_sign)
+        self.contact_force_int = np.zeros((6, 1), dtype=np.float64)
+        self.last_contact_force_error = np.zeros((6, 1), dtype=np.float64)
+        self.last_contact_force_tracking = np.zeros((6, 1), dtype=np.float64)
+        self.prev_contact = False
         self.device = device
 
         self.q_cmd = self.data.qpos.copy()[: self.robot_state.N].astype(np.float64)
+        self.q_target = self.q_cmd.copy()
         self.gripper_cmd = 0.03
         self.last_action = None
-        self.last_pred_pose_p = None
-        self.last_pred_pose_R = None
         self.last_policy_contact = False
         self.last_cmd_update_iter = -1
+        self.pd_cmd = None
+        self.Rd_cmd = None
 
         self.position_infer = SmolVLAJointPositionInfer(
             policy_path=self.smolvla_policy_path,
@@ -351,17 +390,34 @@ class BoltNutPositionSmolVLAEnv(RobotEnv):
             "contact_decimation:",
             self.contact_policy_decimation,
         )
-        if self.tb_writer is not None:
-            print("[BoltNut-Position-SmVLA] tensorboard_logdir:", self.tensorboard_logdir)
+        print("[BoltNut-Position-SmVLA] free_impedance_Kp:", np.diag(self.free_impedance_Kp))
+        print("[BoltNut-Position-SmVLA] free_impedance_KR:", np.diag(self.free_impedance_KR))
+        print("[BoltNut-Position-SmVLA] free_damping_scale:", self.free_impedance_damping_scale)
+        print("[BoltNut-Position-SmVLA] free_tau_limit:", self.free_tau_limit)
+        print("[BoltNut-Position-SmVLA] contact_impedance_Kp:", np.diag(self.contact_impedance_Kp))
+        print("[BoltNut-Position-SmVLA] contact_impedance_KR:", np.diag(self.contact_impedance_KR))
+        print("[BoltNut-Position-SmVLA] contact_damping_scale:", self.contact_impedance_damping_scale)
+        print("[BoltNut-Position-SmVLA] contact_tau_limit:", self.contact_tau_limit)
+        print("[BoltNut-Position-SmVLA] free_control_mode:", self.free_control_mode)
+        print("[BoltNut-Position-SmVLA] free_joint_Kp:", np.diag(self.free_joint_Kp))
+        print("[BoltNut-Position-SmVLA] free_joint_Kd:", np.diag(self.free_joint_Kd))
+        print("[BoltNut-Position-SmVLA] free_joint_tau_limit:", self.free_joint_tau_limit)
+        print("[BoltNut-Position-SmVLA] use_contact_force_tracking:", self.use_contact_force_tracking)
+        print("[BoltNut-Position-SmVLA] contact_force_target:", self.contact_force_target.reshape(-1))
+        print("[BoltNut-Position-SmVLA] contact_force_Kp:", np.diag(self.contact_force_Kp))
+        print("[BoltNut-Position-SmVLA] contact_force_Ki:", np.diag(self.contact_force_Ki))
+        print("[BoltNut-Position-SmVLA] contact_force_Kd:", np.diag(self.contact_force_Kd))
+        print("[BoltNut-Position-SmVLA] contact_force_output_limit:", self.contact_force_output_limit)
+        print("[BoltNut-Position-SmVLA] contact_force_sign:", self.contact_force_sign)
 
     def load_xml(self):
         model_dir = Path(os.getcwd()) / "gufic_env" / "mujoco_models"
         if self.robot_name != "indy7":
             raise NotImplementedError(f"Unsupported robot_name: {self.robot_name}")
         if self.task == "bolt":
-            model_path = model_dir / "Indy7_nutbolt_position.xml"
+            model_path = model_dir / "Indy7_nutbolt_impedance.xml"
         else:
-            model_path = model_dir / "Indy7_nutbolt_position.xml"
+            model_path = model_dir / "Indy7_nutbolt_impedance.xml"
 
         self.model = mujoco.MjModel.from_xml_path(str(model_path))
         self.data = mujoco.MjData(self.model)
@@ -384,20 +440,12 @@ class BoltNutPositionSmolVLAEnv(RobotEnv):
         mujoco.mj_forward(self.model, self.data)
         self.robot_state.update()
         self.q_cmd = self.data.qpos.copy()[: self.robot_state.N].astype(np.float64)
-        self.set_control_position(self.q_cmd, self.gripper_cmd)
+        self.q_target = self.q_cmd.copy()
+        self.pd_cmd, self.Rd_cmd = self.qpos_to_pose(self.q_cmd)
+        self.robot_state.set_control_torque(np.zeros(self.robot_state.N), self.gripper_cmd)
 
     def resize_rgb(self, image):
         return resize_rgb(image)
-
-    def set_control_position(self, q_cmd, gripper=0.03):
-        q_cmd = np.asarray(q_cmd, dtype=np.float64).reshape(self.robot_state.N)
-        ctrl_range = self.model.actuator_ctrlrange[: self.robot_state.N]
-        q_cmd = np.clip(q_cmd, ctrl_range[:, 0], ctrl_range[:, 1])
-        self.data.ctrl[: self.robot_state.N] = q_cmd
-
-        if self.model.nu >= self.robot_state.N + 2:
-            self.data.ctrl[self.robot_state.N] = -float(gripper)
-            self.data.ctrl[self.robot_state.N + 1] = float(gripper)
 
     def qpos_to_pose(self, q_arm):
         q_arm = np.asarray(q_arm, dtype=np.float64).reshape(self.robot_state.N)
@@ -419,44 +467,6 @@ class BoltNutPositionSmolVLAEnv(RobotEnv):
         mujoco.mj_forward(self.model, self.data)
         self.robot_state.update()
         return p_des, R_des
-
-    def _euler_deg(self, R):
-        return RT.from_matrix(np.asarray(R, dtype=np.float64).reshape(3, 3)).as_euler("xyz", degrees=True)
-
-    def _write_pose_tensorboard(self, p, R):
-        if self.tb_writer is None or self.last_pred_pose_p is None or self.last_pred_pose_R is None:
-            return
-
-        step = int(self.iter)
-        p = np.asarray(p, dtype=np.float64).reshape(3)
-        R = np.asarray(R, dtype=np.float64).reshape(3, 3)
-        pred_p = np.asarray(self.last_pred_pose_p, dtype=np.float64).reshape(3)
-        pred_R = np.asarray(self.last_pred_pose_R, dtype=np.float64).reshape(3, 3)
-        actual_r = self._euler_deg(R)
-        pred_r = self._euler_deg(pred_R)
-
-        names = ("x", "y", "z")
-        for i, name in enumerate(names):
-            self.tb_writer.add_scalars(
-                f"pose_compare/position/{name}",
-                {"inferred": float(pred_p[i]), "actual": float(p[i])},
-                step,
-            )
-            self.tb_writer.add_scalars(
-                f"pose_compare/euler_deg/{name}",
-                {"inferred": float(pred_r[i]), "actual": float(actual_r[i])},
-                step,
-            )
-
-        self.tb_writer.add_scalar("pose_compare/error/position_norm", float(np.linalg.norm(pred_p - p)), step)
-        self.tb_writer.add_scalar(
-            "pose_compare/error/rotation_deg",
-            float(RT.from_matrix(pred_R.T @ R).magnitude() * 180.0 / np.pi),
-            step,
-        )
-
-        if step % 100 == 0:
-            self.tb_writer.flush()
 
     def _smooth_q_command(self, q_des):
         q_des = np.asarray(q_des, dtype=np.float64).reshape(self.robot_state.N)
@@ -491,28 +501,130 @@ class BoltNutPositionSmolVLAEnv(RobotEnv):
             gripper = float((1.0 - alpha) * self.last_action[-1] + alpha * gripper)
 
         self.last_action = np.concatenate([q_des, np.array([gripper])]).astype(np.float64)
-        self.last_pred_pose_p, self.last_pred_pose_R = self.qpos_to_pose(q_des)
-        self.q_cmd = self._smooth_q_command(q_des)
+        self.q_target = q_des.copy()
         self.gripper_cmd = gripper
 
         print_period = max(1, self.policy_decimation * 5)
         if self.iter % print_period == 0:
             q_now = self.data.qpos.copy()[: self.robot_state.N]
+            p_now, R_now = self.robot_state.get_pose()
             print("[BoltNut-Position-SmVLA] p_now:", p.reshape(3))
             print("[BoltNut-Position-SmVLA] q_pred:", q_des)
+            print("[BoltNut-Position-SmVLA] q_target:", self.q_target)
             print("[BoltNut-Position-SmVLA] q_cmd:", self.q_cmd)
+            print("[BoltNut-Position-SmVLA] q_target_cmd_gap:", np.linalg.norm(self.q_target - self.q_cmd))
+            print("[BoltNut-Position-SmVLA] pd_cmd:", self.pd_cmd)
+            print("[BoltNut-Position-SmVLA] p_err_to_pd_cmd:", np.linalg.norm(p_now - self.pd_cmd))
             print("[BoltNut-Position-SmVLA] gripper:", self.gripper_cmd)
             print("[BoltNut-Position-SmVLA] q_track_err:", np.linalg.norm(q_now - self.q_cmd))
 
+    def _select_impedance_gains(self, contact):
+        if contact:
+            return (
+                self.contact_impedance_Kp,
+                self.contact_impedance_KR,
+                self.contact_impedance_damping_scale,
+                self.contact_tau_limit,
+            )
+        return (
+            self.free_impedance_Kp,
+            self.free_impedance_KR,
+            self.free_impedance_damping_scale,
+            self.free_tau_limit,
+        )
+
+    def _contact_force_tracking_wrench(self, Fe, dFe=None):
+        Fe = np.asarray(Fe, dtype=np.float64).reshape(6, 1)
+        dFe = np.zeros((6, 1), dtype=np.float64) if dFe is None else np.asarray(dFe, dtype=np.float64).reshape(6, 1)
+
+        Fd_star = self.contact_force_target
+        force_error = -Fe - Fd_star
+        de_force = -dFe
+        self.last_contact_force_error = force_error.copy()
+        self.contact_force_int = self.contact_force_int + force_error * self.dt
+        if self.contact_force_int_limit > 0.0:
+            self.contact_force_int = np.clip(
+                self.contact_force_int,
+                -self.contact_force_int_limit,
+                self.contact_force_int_limit,
+            )
+
+        F_force = (
+            -self.contact_force_Kp @ (-Fe)
+            - self.contact_force_Ki @ self.contact_force_int
+            - self.contact_force_Kd @ de_force
+            + Fd_star
+        )
+        F_force = self.contact_force_sign * F_force
+        if self.contact_force_output_limit > 0.0:
+            F_force = np.clip(
+                F_force,
+                -self.contact_force_output_limit,
+                self.contact_force_output_limit,
+            )
+        self.last_contact_force_tracking = F_force.copy()
+        return F_force
+
+    def impedance_control(self, contact=False, Fe=None, dFe=None):
+        if self.pd_cmd is None or self.Rd_cmd is None:
+            self.pd_cmd, self.Rd_cmd = self.qpos_to_pose(self.q_cmd)
+
+        Kp, KR, damping_scale, tau_limit = self._select_impedance_gains(contact)
+        Jb = self.robot_state.get_body_jacobian()
+        G = self.robot_state.get_bias_torque().reshape(-1, 1)
+        p, R = self.robot_state.get_pose()
+        pd = np.asarray(self.pd_cmd, dtype=np.float64).reshape(3)
+        Rd = np.asarray(self.Rd_cmd, dtype=np.float64).reshape(3, 3)
+
+        fp = R.T @ Rd @ Kp @ Rd.T @ (p - pd).reshape(3, 1)
+        fR = vee_map(KR @ Rd.T @ R - R.T @ Rd @ KR)
+        fg = np.vstack((fp, fR))
+
+        eV = self.robot_state.get_body_ee_velocity()
+        gains = np.concatenate(
+            [np.diag(Kp), np.diag(KR)],
+            axis=0,
+        )
+        Kd = np.diag(np.sqrt(np.maximum(gains, 0.0))) * damping_scale
+
+        tau_tilde = -fg - Kd @ eV
+
+        F_force = np.zeros((6, 1), dtype=np.float64)
+        if contact and self.use_contact_force_tracking and Fe is not None:
+            F_force = self._contact_force_tracking_wrench(Fe, dFe=dFe)
+            tau_tilde = tau_tilde + F_force
+        tau_cmd = Jb.T @ tau_tilde + G
+        tau_cmd = tau_cmd.reshape(-1)
+        if tau_limit > 0.0:
+            tau_cmd = np.clip(tau_cmd, -tau_limit, tau_limit)
+        return tau_cmd
+
+    def joint_position_torque_control(self):
+        q = self.data.qpos.copy()[: self.robot_state.N].reshape(-1)
+        dq = self.data.qvel.copy()[: self.robot_state.N].reshape(-1)
+        q_des = np.asarray(self.q_cmd, dtype=np.float64).reshape(self.robot_state.N)
+        G = self.robot_state.get_bias_torque().reshape(-1)
+
+        tau_cmd = self.free_joint_Kp @ (q_des - q) - self.free_joint_Kd @ dq + G
+        if self.free_joint_tau_limit > 0.0:
+            tau_cmd = np.clip(tau_cmd, -self.free_joint_tau_limit, self.free_joint_tau_limit)
+        return tau_cmd.reshape(-1)
+
     def step(self):
         self.robot_state.update()
-        Fe_now = np.asarray(self.get_FT_value(), dtype=np.float32).reshape(-1)
+
+        Fe_now, dFe_now = self.get_FT_value(return_derivative=True)
+        Fe_now = np.asarray(Fe_now, dtype=np.float32).reshape(-1)
+        dFe_now = np.asarray(dFe_now, dtype=np.float32).reshape(-1)
         print("[BoltNut-Position-SmVLA] Fe:", Fe_now)
-        Fe_now = np.asarray(self.get_FT_value(), dtype=np.float32).reshape(-1)
         contact = abs(float(Fe_now[2])) > self.contact_force_threshold
         decimation = self.contact_policy_decimation if contact else self.policy_decimation
         contact_changed = contact != self.last_policy_contact
         update_policy = contact_changed or self.iter % decimation == 0
+        if contact_changed and contact:
+            self.contact_force_int[:] = 0.0
+        elif not contact:
+            self.contact_force_int[:] = 0.0
 
         if update_policy:
             if contact_changed:
@@ -521,26 +633,46 @@ class BoltNutPositionSmolVLAEnv(RobotEnv):
             self.last_policy_contact = contact
             self.last_cmd_update_iter = self.iter
 
-        self.set_control_position(self.q_cmd, self.gripper_cmd)
+        self.q_cmd = self._smooth_q_command(self.q_target)
+        self.pd_cmd, self.Rd_cmd = self.qpos_to_pose(self.q_cmd)
+
+        # control_mode = "task_impedance" if contact or self.free_control_mode == "task_impedance" else "joint_pd"
+        control_mode = "joint_pd"
+        if control_mode == "task_impedance":
+            tau_cmd = self.impedance_control(contact=contact, Fe=Fe_now, dFe=dFe_now)
+        else:
+            tau_cmd = self.joint_position_torque_control()
+        self.robot_state.set_control_torque(tau_cmd, self.gripper_cmd)
         self.robot_state.update_dynamic()
+
+        if self.iter % max(1, self.policy_decimation * 5) == 0:
+            q_now = self.data.qpos.copy()[: self.robot_state.N]
+            print("[BoltNut-Position-SmVLA] control_mode:", control_mode)
+            print("[BoltNut-Position-SmVLA] q_target_cmd_gap:", np.linalg.norm(self.q_target - self.q_cmd))
+            print("[BoltNut-Position-SmVLA] q_track_err_after:", np.linalg.norm(q_now - self.q_cmd))
+            print("[BoltNut-Position-SmVLA] tau_norm:", np.linalg.norm(tau_cmd))
+            print("[BoltNut-Position-SmVLA] tau_max_abs:", np.max(np.abs(tau_cmd)))
+            if contact and self.use_contact_force_tracking:
+                print("[BoltNut-Position-SmVLA] force_target:", self.contact_force_target.reshape(6))
+                print("[BoltNut-Position-SmVLA] force_error:", self.last_contact_force_error.reshape(6))
+                print("[BoltNut-Position-SmVLA] F_force_tracking:", self.last_contact_force_tracking.reshape(6))
 
         if self.show_viewer and self.iter % 10 == 0:
             self.viewer.sync()
 
         obs = {}
         p, R = self.robot_state.get_pose()
-        self._write_pose_tensorboard(p, R)
         Fe = self.get_FT_value()
         Fe_raw = self.get_FT_value_raw()
         for observable in self.observables:
             if observable == "p":
                 obs[observable] = p.copy()
             elif observable == "pd":
-                obs[observable] = p.copy()
+                obs[observable] = self.pd_cmd.copy() if self.pd_cmd is not None else p.copy()
             elif observable == "R":
                 obs[observable] = R.copy()
             elif observable == "Rd":
-                obs[observable] = R.copy()
+                obs[observable] = self.Rd_cmd.copy() if self.Rd_cmd is not None else R.copy()
             elif observable == "Fe":
                 obs[observable] = Fe.copy()
             elif observable == "Fe_raw":
@@ -556,7 +688,15 @@ class BoltNutPositionSmolVLAEnv(RobotEnv):
 
         done = self.iter == self.max_iter - 1
         reward = 0.0
-        info = {"contact": contact, "q_cmd": self.q_cmd.copy(), "gripper": self.gripper_cmd}
+        info = {
+            "contact": contact,
+            "q_cmd": self.q_cmd.copy(),
+            "pd_cmd": None if self.pd_cmd is None else self.pd_cmd.copy(),
+            "Rd_cmd": None if self.Rd_cmd is None else self.Rd_cmd.copy(),
+            "tau_cmd": tau_cmd.copy(),
+            "control_mode": control_mode,
+            "gripper": self.gripper_cmd,
+        }
         self.iter += 1
         return obs, reward, done, info
 
@@ -579,7 +719,7 @@ class BoltNutPositionSmolVLAEnv(RobotEnv):
 
 DEFAULT_SMOLVLA_POLICY_PATHS = (
     "/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/"
-    "checkpoints_smolvla_v_position/015000/pretrained_model"
+    "checkpoints_smolvla_v_position/020000/pretrained_model"
 )
 def parse_args():
     parser = argparse.ArgumentParser(description="Online SmolVLA joint-position inference for nut-bolt.")
@@ -592,15 +732,59 @@ def parse_args():
     parser.add_argument("--max_time", type=float, default=12.0)
     parser.add_argument("--policy_hz", type=float, default=50.0)
     parser.add_argument("--contact_policy_hz", type=float, default=50.0)
-    parser.add_argument("--contact_force_threshold", type=float, default=1.0)
+    parser.add_argument("--contact_force_threshold", type=float, default=0.5)
     parser.add_argument("--reset_each_update", action="store_true")
     parser.add_argument("--action_lowpass_alpha", type=float, default=1.0)
     parser.add_argument("--q_cmd_alpha", type=float, default=1.0)
-    parser.add_argument("--q_cmd_max_delta", type=float, default=0.01)
+    parser.add_argument("--q_cmd_max_delta", type=float, default=0.001)
     parser.add_argument("--q_cmd_startup_max_delta", type=float, default=0.002)
     parser.add_argument("--q_cmd_startup_steps", type=int, default=1000)
-    parser.add_argument("--save_tensorboard", default=True, action="store_true")
-    parser.add_argument("--tensorboard_logdir", default="./gufic/pose_smolvla")
+    parser.add_argument("--free_impedance_kp", type=float, nargs=3, default=[5500.0, 5500.0, 5000.0])
+    parser.add_argument("--free_impedance_kr", type=float, nargs=3, default=[1000.0, 1000.0, 1000.0])
+    parser.add_argument("--free_impedance_damping_scale", type=float, default=8.0)
+    parser.add_argument("--free_tau_limit", type=float, default=1000.0)
+    parser.add_argument("--contact_impedance_kp", type=float, nargs=3, default=[500.0, 500.0, 80.0])
+    parser.add_argument("--contact_impedance_kr", type=float, nargs=3, default=[250.0, 250.0, 250.0])
+    parser.add_argument("--contact_impedance_damping_scale", type=float, default=6.0)
+    parser.add_argument("--contact_tau_limit", type=float, default=300.0)
+    parser.add_argument("--free_control_mode", choices=["joint_pd", "task_impedance"], default="joint_pd")
+    parser.add_argument(
+        "--free_joint_kp",
+        type=float,
+        nargs=6,
+        default=[3000.0, 8000.0, 8000.0, 8000.0, 5000.0, 1000.0],
+    )
+    parser.add_argument("--free_joint_damping_scale", type=float, default=2.0)
+    parser.add_argument("--free_joint_tau_limit", type=float, default=8000.0)
+    parser.add_argument("--enable_contact_external_force", action="store_true")
+    parser.add_argument("--disable_contact_force_tracking", action="store_true")
+    parser.add_argument(
+        "--contact_force_target",
+        type=float,
+        nargs=6,
+        default=[0.0, 0.0, -10.0, 0.0, 0.0, 0.0],
+    )
+    parser.add_argument(
+        "--contact_force_kp",
+        type=float,
+        nargs=6,
+        default=[0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+    )
+    parser.add_argument(
+        "--contact_force_ki",
+        type=float,
+        nargs=6,
+        default=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    parser.add_argument(
+        "--contact_force_kd",
+        type=float,
+        nargs=6,
+        default=[0.0, 0.0, 0.02, 0.0, 0.0, 0.0],
+    )
+    parser.add_argument("--contact_force_int_limit", type=float, default=20.0)
+    parser.add_argument("--contact_force_output_limit", type=float, default=80.0)
+    parser.add_argument("--contact_force_sign", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fixed_start", action="store_true")
     parser.add_argument("--show_viewer", action="store_true", default=True)
@@ -626,8 +810,7 @@ def main():
         use_learned_velocity_field=False,
         record_demos=False,
         seed=args.seed,
-        save_tensorboard=args.save_tensorboard,
-        tensorboard_logdir=args.tensorboard_logdir,
+        save_tensorboard=False,
         visualize_delta_pose=False,
         smolvla_policy_path=args.policy_path,
         smolvla_dataset_repo_id=args.dataset_repo_id,
@@ -644,6 +827,26 @@ def main():
         q_cmd_max_delta=args.q_cmd_max_delta,
         q_cmd_startup_max_delta=args.q_cmd_startup_max_delta,
         q_cmd_startup_steps=args.q_cmd_startup_steps,
+        free_impedance_kp=args.free_impedance_kp,
+        free_impedance_kr=args.free_impedance_kr,
+        free_impedance_damping_scale=args.free_impedance_damping_scale,
+        free_tau_limit=args.free_tau_limit,
+        contact_impedance_kp=args.contact_impedance_kp,
+        contact_impedance_kr=args.contact_impedance_kr,
+        contact_impedance_damping_scale=args.contact_impedance_damping_scale,
+        contact_tau_limit=args.contact_tau_limit,
+        free_control_mode=args.free_control_mode,
+        free_joint_kp=args.free_joint_kp,
+        free_joint_damping_scale=args.free_joint_damping_scale,
+        free_joint_tau_limit=args.free_joint_tau_limit,
+        use_contact_force_tracking=not args.disable_contact_force_tracking,
+        contact_force_target=args.contact_force_target,
+        contact_force_kp=args.contact_force_kp,
+        contact_force_ki=args.contact_force_ki,
+        contact_force_kd=args.contact_force_kd,
+        contact_force_int_limit=args.contact_force_int_limit,
+        contact_force_output_limit=args.contact_force_output_limit,
+        contact_force_sign=args.contact_force_sign,
     )
 
     try:
@@ -651,9 +854,6 @@ def main():
     finally:
         if env.viewer is not None:
             env.viewer.close()
-        if getattr(env, "tb_writer", None) is not None:
-            env.tb_writer.flush()
-            env.tb_writer.close()
 
 
 if __name__ == "__main__":

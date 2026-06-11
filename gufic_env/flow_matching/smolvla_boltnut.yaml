@@ -7,6 +7,7 @@ policy:
   chunk_size: 10
   n_action_steps: 10
   device: cuda
+  vlm_model_name: /home/zhou/.cache/huggingface/hub/models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct/snapshots/7b375e1b73b11138ff12fe22c8f2822d8fe03467
 
 save_checkpoint: true
 output_dir: /home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_smolvla_boltnut

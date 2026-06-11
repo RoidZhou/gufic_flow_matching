@@ -53,7 +53,8 @@ class RobotEnv:
                  pi0_save_dir=None,
                  pi0_repo_id="gufic_bolt_pi0",
                  pi0_language="insert the bolt into the hole",
-                 pi0_fps=20, save_fm=False, save_pi0=True):
+                 pi0_fps=50, pi0_default_fps=50, pi0_contact_force_threshold=1.0,
+                 save_fm=False, save_pi0=True):
         
         self.robot_name = robot_name
         self.task = task
@@ -79,6 +80,9 @@ class RobotEnv:
         self.pi0_repo_id = pi0_repo_id
         self.pi0_language = pi0_language
         self.pi0_fps = pi0_fps
+        self.pi0_default_fps = pi0_default_fps
+        self.pi0_contact_fps = pi0_fps
+        self.pi0_contact_force_threshold = pi0_contact_force_threshold
         self.pi0_dataset = None
         self.pi0_enabled = pi0_save_dir is not None
         self.pi0_episode_has_frames = False
@@ -96,8 +100,8 @@ class RobotEnv:
         self.depth_renderer = None
         self.external_rgb_renderer = None
 
-        self.cam_height = 256 if self.pi0_enabled else 128
-        self.cam_width = 256 if self.pi0_enabled else 128
+        self.cam_height = 256
+        self.cam_width = 256
         self.num_points = 4096
 
         self.camera_matrix = np.eye(3, dtype=np.float32)
@@ -144,6 +148,28 @@ class RobotEnv:
         self.dt = self.model.opt.timestep
         self.max_iter = int(max_time/self.dt)
         self.max_time = max_time
+        self.pi0_default_decimation = max(
+            1,
+            int(round(1.0 / (max(float(self.pi0_default_fps), 1e-8) * self.dt))),
+        )
+        self.pi0_contact_decimation = max(
+            1,
+            int(round(1.0 / (max(float(self.pi0_contact_fps), 1e-8) * self.dt))),
+        )
+        self.pi0_default_actual_fps = 1.0 / (self.pi0_default_decimation * self.dt)
+        self.pi0_contact_actual_fps = 1.0 / (self.pi0_contact_decimation * self.dt)
+        if self.pi0_enabled:
+            print(
+                f"[Pi0] non_contact_fps={self.pi0_default_fps}, dt={self.dt}, "
+                f"decimation={self.pi0_default_decimation}, "
+                f"actual_fps={self.pi0_default_actual_fps:.3f}"
+            )
+            print(
+                f"[Pi0] contact_fps={self.pi0_contact_fps}, "
+                f"decimation={self.pi0_contact_decimation}, "
+                f"actual_fps={self.pi0_contact_actual_fps:.3f}, "
+                f"force_threshold={self.pi0_contact_force_threshold}"
+            )
 
         self.iter = 0
 
@@ -645,6 +671,7 @@ class RobotEnv:
 
 
         for i in range(self.max_iter):
+            # start_time = time.time()
             self.golbal_steps = i
 
             pd, Rd, vd, wd, dvd, dwd = self.update_desired_trajectory()
@@ -697,7 +724,8 @@ class RobotEnv:
                 self.visualize_point_cloud_once()
             if done:
                 break
-
+            # end_time = time.time()
+            # print(f"代码执行时间: {end_time - start_time:.2f} 秒")
             # self.iter = i
 
         return p_list, R_list, x_tf_list, x_ti_list, Fe_list, Fd_list, pd_list, Fe_raw_list
@@ -1028,7 +1056,9 @@ class RobotEnv:
                 Fe=np.asarray(Fe).reshape(6),
                 point_cloud=point_cloud,
             )
-        if self.save_pi0:
+        pi0_contact = abs(float(np.asarray(Fe).reshape(-1)[2])) > self.pi0_contact_force_threshold
+        pi0_decimation = self.pi0_contact_decimation if pi0_contact else self.pi0_default_decimation
+        if self.save_pi0 and self.iter % pi0_decimation == 0:
             self.add_pi0_frame(
                 p=p,
                 R=R,
@@ -1245,7 +1275,7 @@ if __name__ == "__main__":
     assert task in ['regulation', 'circle', 'line', 'sphere', 'insertion', "bolt"]
 
     save_dir = "/media/zhou/Elements SE/VLA/boltnut3_demos_vis_random_start"
-    pi0_save_dir = "/media/zhou/Elements SE/VLA/boltnut3_pi0_lerobot_random_start"
+    pi0_save_dir = "/media/zhou/Elements SE/VLA/boltnut_pi0_lerobot_50HZ"
     pi0_repo_id = "gufic_boltnut_pi0"
     pi0_language = "insert the bolt into the hole"
     save_pi0 = True
@@ -1277,7 +1307,7 @@ if __name__ == "__main__":
                   inertia_shaping = inertia_shaping, save_dir=save_dir,save_tensorboard=save_tensorboard,
                   pi0_save_dir=pi0_save_dir, pi0_repo_id=pi0_repo_id, pi0_language=pi0_language, save_fm=save_fm, save_pi0=save_pi0)
     
-    for episode in range(0, 50):
+    for episode in range(0, 80):
         RE.reset()
         RE.run()
         success = RE.check_task_success()

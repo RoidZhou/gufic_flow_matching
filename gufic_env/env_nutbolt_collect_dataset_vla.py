@@ -21,7 +21,7 @@ from gufic_env.env_gufic_velocity_field_infer_smolvla import RobotEnv
 
 TASK_NAME = "insert the bolt into the hole"
 DEFAULT_REPO_ID = "gufic_nutbolt_position_smolvla"
-DEFAULT_ROOT = "/media/zhou/Elements SE/VLA/nutbolt_position_smolvla"
+DEFAULT_ROOT = "/media/zhou/Elements SE/VLA/nutbolt_position_smolvla2"
 
 
 def resize_rgb(image, size=(256, 256)):
@@ -353,6 +353,8 @@ class NutBoltPositionCollectEnv(RobotEnv):
         done = False
         while self.iter < self.max_iter:
             pd, Rd, q_des = self.step_position_control()
+            Fe_now = np.asarray(self.get_FT_value(), dtype=np.float32).reshape(-1)
+            print("[BoltNut-Position-SmVLA] Fe:", Fe_now)
 
             if self.iter % self.collect_decimation == 0:
                 external_image, wrist_image = self.get_images()

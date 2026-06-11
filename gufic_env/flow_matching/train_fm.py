@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from dataset import FlowMatchingDataset, RollingForceHistoryFMDataset
-from model import VelocityFMMLP, VelocityFMTransformer,VelocityFMCondUnet1D, VisionDeltaPoseNet
+from model import VelocityFMMLP, VelocityFMTransformer,VelocityFMCondUnet1D, VisionDeltaPoseNet, VisionDeltaPoseFMTransformer, VisionPoseObsEncoder, VisionPoseObsEncoderPoseSimple, VisionPoseObsEncoderPoseSimpleV2,VisionPoseObsEncoderNoPCForVelocity
 from config import TrainConfig
 from cfm import CurvedPathCFM
 import csv
@@ -29,6 +29,7 @@ def save_train_checkpoint(
     epoch,
     model,
     obs_encoder,
+    pose_model,
     optimizer,
     scheduler,
     best_loss,
@@ -39,6 +40,7 @@ def save_train_checkpoint(
         "epoch": epoch,
         "model": model.state_dict(),
         "obs_encoder": obs_encoder.state_dict(),
+        "pose_model": pose_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "best_loss": best_loss,
@@ -265,15 +267,37 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # ===== 先建模型/优化器，方便 resume =====
-    obs_encoder = VisionDeltaPoseNet(
+    # obs_encoder = VisionPoseObsEncoder(
+    #     state_dim=cfg.state_dim,
+    #     cond_dim=cfg.cond_dim,
+    #     guide_dim=cfg.guide_dim,
+    #     embed_dim=cfg.embed_dim,
+    #     input_channels=cfg.input_channels,
+    #     input_transform=cfg.input_transform,
+    # ).to(device)
+    obs_dim = getattr(cfg, "obs_dim", 128)
+
+    obs_encoder = VisionPoseObsEncoderNoPCForVelocity(
         state_dim=cfg.state_dim,
+        cond_dim=cfg.cond_dim,
+        obs_dim=obs_dim,
         guide_dim=cfg.guide_dim,
         embed_dim=cfg.embed_dim,
         input_channels=cfg.input_channels,
         input_transform=cfg.input_transform,
     ).to(device)
 
-    model = VelocityFMTransformer(
+    pose_model = VelocityFMTransformer(
+        x_dim=9,                 # [pd(3), Rd6d(6)]
+        cond_dim=obs_dim,            # nx 维度
+        guide_dim=cfg.guide_dim,
+        time_dim=cfg.time_dim,
+        hidden_dim=cfg.hidden_dim,
+        num_layers=cfg.num_layers,
+        use_cond=True,
+    ).to(device)
+
+    velocity_model = VelocityFMTransformer(
         x_dim=6,
         cond_dim=cfg.cond_dim,
         guide_dim=cfg.guide_dim,
@@ -284,7 +308,7 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
     ).to(device)
 
     optimizer = torch.optim.AdamW(
-        list(model.parameters()) + list(obs_encoder.parameters()),
+        list(velocity_model.parameters()) + list(obs_encoder.parameters()) + list(pose_model.parameters()),
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
     )
@@ -303,7 +327,7 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
 
     start_epoch, best_loss, resume_cond_stats, resumed = try_resume_from_checkpoint(
         resume_path=resume_path,
-        model=model,
+        model=velocity_model,
         obs_encoder=obs_encoder,
         optimizer=optimizer,
         scheduler=scheduler,
@@ -368,49 +392,72 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         return
 
     for epoch in range(start_epoch, cfg.epochs + 1):
-        model.train()
+        velocity_model.train()
+        pose_model.train()
         obs_encoder.train()
 
         train_sum, train_count = 0.0, 0
         train_fm_sum, train_dp_sum, train_dR_sum = 0.0, 0.0, 0.0
 
-        for cond_hist, x_now, pc_hist, delta_pose_target, v_future in train_loader:
+        for cond_hist, x_now, pc_hist, desired_pose_target, v_future in train_loader:
             cond_hist_flat = cond_hist.to(device).float()
             pc_hist = pc_hist.to(device).float()
-            delta_pose_target = delta_pose_target.to(device).float()
-            v_future = v_future.to(device).float()
             x_now = x_now.to(device).float()
+            desired_pose_target = desired_pose_target.to(device).float()  # [B,9]
+            v_future = v_future.to(device).float()                        # [B,H,6]
 
-            _, x1, t, xt, ut = path_sampler.sample_training_tuple(v_future)
-            guide_feat, delta_pose_pred = obs_encoder(pc_hist, x_now)
-
-            pred = model(
-                x_t=xt,
-                t=t,
-                cond_main=cond_hist_flat,
-                guide=guide_feat,
+            # obs encoder 只生成条件
+            nx_pose, guide_vel = obs_encoder(
+                pc_hist,
+                x_now,
+                cond_hist=cond_hist_flat,
             )
 
-            train_loss_fm = F.mse_loss(pred, ut)
-            loss_dp = F.smooth_l1_loss(delta_pose_pred[:, :3], delta_pose_target[:, :3])
-            loss_dR = F.smooth_l1_loss(delta_pose_pred[:, 3:], delta_pose_target[:, 3:])
-            loss_delta = 2.0 * loss_dp + 1.0 * loss_dR
+            # ========== 1) pose Flow Matching ==========
+            desired_pose_seq = desired_pose_target.unsqueeze(1)  # [B,1,9]
 
-            loss = train_loss_fm + cfg.lambda_delta * loss_delta
+            _, _, t_pose, zt_pose, ut_pose = path_sampler.sample_training_tuple(
+                desired_pose_seq
+            )
+
+            pred_pose_flow = pose_model(
+                x_t=zt_pose,
+                t=t_pose,
+                cond_main=nx_pose,
+                guide=None,
+            )
+
+            train_loss_pose_p = F.mse_loss(pred_pose_flow[..., :3], ut_pose[..., :3])
+            train_loss_pose_R = F.mse_loss(pred_pose_flow[..., 3:], ut_pose[..., 3:])
+            train_loss_pose = 2.0 * train_loss_pose_p + 1.0 * train_loss_pose_R
+
+            # ========== 2) velocity Flow Matching ==========
+            _, _, t_v, zt_v, ut_v = path_sampler.sample_training_tuple(v_future)
+
+            pred_v_flow = velocity_model(
+                x_t=zt_v,
+                t=t_v,
+                cond_main=cond_hist_flat,
+                guide=guide_vel,
+            )
+
+            train_loss_vel = F.mse_loss(pred_v_flow, ut_v)
+
+            train_loss = train_loss_vel + cfg.lambda_delta * train_loss_pose
 
             optimizer.zero_grad()
-            loss.backward()
+            train_loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                list(model.parameters()) + list(obs_encoder.parameters()),
+                list(pose_model.parameters()) + list(obs_encoder.parameters()) + list(velocity_model.parameters()),
                 max_norm=0.5
             )
             optimizer.step()
 
             bs = cond_hist_flat.shape[0]
-            train_sum += loss.item() * bs
-            train_fm_sum += train_loss_fm.item() * bs
-            train_dp_sum += loss_dp.item() * bs
-            train_dR_sum += loss_dR.item() * bs
+            train_sum += train_loss.item() * bs
+            train_fm_sum += train_loss_vel.item() * bs
+            train_dp_sum += train_loss_pose_p.item() * bs
+            train_dR_sum += train_loss_pose_R.item() * bs
             train_count += bs
 
         train_loss = train_sum / max(train_count, 1)
@@ -420,8 +467,9 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
 
         scheduler.step()
 
-        model.eval()
+        pose_model.eval()
         obs_encoder.eval()
+        velocity_model.eval()
 
         val_sum, val_count = 0.0, 0
         val_fm_sum, val_dp_sum, val_dR_sum = 0.0, 0.0, 0.0
@@ -431,35 +479,57 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         torch.cuda.manual_seed_all(1234)
 
         with torch.no_grad():
-            for cond_hist_flat, x_now, pc_hist, delta_pose_target, v_future in val_loader:
-                cond_hist_flat = cond_hist_flat.to(device).float()
+            for cond_hist_flat, x_now, pc_hist, desired_pose_target, v_future in val_loader:
+                cond_hist_flat = cond_hist.to(device).float()
                 pc_hist = pc_hist.to(device).float()
-                delta_pose_target = delta_pose_target.to(device).float()
-                v_future = v_future.to(device).float()
-
                 x_now = x_now.to(device).float()
+                desired_pose_target = desired_pose_target.to(device).float()  # [B,9]
+                v_future = v_future.to(device).float()                        # [B,H,6]
 
-                _, x1, t, xt, ut = path_sampler.sample_training_tuple(v_future)
-                guide_feat, delta_pose_pred = obs_encoder(pc_hist, x_now)
+                # obs encoder 只生成条件
+                nx, guide_feat = obs_encoder(
+                    pc_hist,
+                    x_now,
+                    cond_hist=cond_hist_flat,
+                )
 
-                pred = model(
-                    x_t=xt,
-                    t=t,
+                # ========== 1) pose Flow Matching ==========
+                desired_pose_seq = desired_pose_target.unsqueeze(1)  # [B,1,9]
+
+                _, _, t_pose, zt_pose, ut_pose = path_sampler.sample_training_tuple(
+                    desired_pose_seq
+                )
+
+                pred_pose_flow = pose_model(
+                    x_t=zt_pose,
+                    t=t_pose,
+                    cond_main=nx,
+                    guide=None,
+                )
+
+                val_loss_pose_p = F.mse_loss(pred_pose_flow[..., :3], ut_pose[..., :3])
+                val_loss_pose_R = F.mse_loss(pred_pose_flow[..., 3:], ut_pose[..., 3:])
+                val_loss_pose = 2.0 * val_loss_pose_p + 1.0 * val_loss_pose_R
+
+                # ========== 2) velocity Flow Matching ==========
+                _, _, t_v, zt_v, ut_v = path_sampler.sample_training_tuple(v_future)
+
+                pred_v_flow = velocity_model(
+                    x_t=zt_v,
+                    t=t_v,
                     cond_main=cond_hist_flat,
                     guide=guide_feat,
                 )
 
-                val_loss_fm = F.mse_loss(pred, ut)
-                loss_dp = F.smooth_l1_loss(delta_pose_pred[:, :3], delta_pose_target[:, :3])
-                loss_dR = F.smooth_l1_loss(delta_pose_pred[:, 3:], delta_pose_target[:, 3:])
-                loss_delta = 2.0 * loss_dp + 1.0 * loss_dR
-                loss = val_loss_fm + cfg.lambda_delta * loss_delta
+                val_loss_vel = F.mse_loss(pred_v_flow, ut_v)
+
+                val_loss = val_loss_vel + cfg.lambda_delta * val_loss_pose
 
                 bs = cond_hist_flat.shape[0]
-                val_sum += loss.item() * bs
-                val_fm_sum += val_loss_fm.item() * bs
-                val_dp_sum += loss_dp.item() * bs
-                val_dR_sum += loss_dR.item() * bs
+                val_sum += val_loss.item() * bs
+                val_fm_sum += val_loss_vel.item() * bs
+                val_dp_sum += val_loss_pose_p.item() * bs
+                val_dR_sum += val_loss_pose_R.item() * bs
                 val_count += bs
 
         val_loss = val_sum / max(val_count, 1)
@@ -471,8 +541,9 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
         save_train_checkpoint(
             save_path=os.path.join(cfg.save_dir, "last.pt"),
             epoch=epoch,
-            model=model,
+            model=velocity_model,
             obs_encoder=obs_encoder,
+            pose_model=pose_model,
             optimizer=optimizer,
             scheduler=scheduler,
             best_loss=best_loss,
@@ -486,8 +557,9 @@ def train_velocity_field_rolling_horizon(cfg: TrainConfig, path_sampler: CurvedP
             save_train_checkpoint(
                 save_path=os.path.join(cfg.save_dir, f"cfm_{cfg.model}_{cfg.type}_best.pt"),
                 epoch=epoch,
-                model=model,
+                model=velocity_model,
                 obs_encoder=obs_encoder,
+                pose_model=pose_model,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 best_loss=best_loss,

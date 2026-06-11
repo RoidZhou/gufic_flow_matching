@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<mujoco model="Indy7_boltnut_m20">
+<mujoco model="Indy7_boltnut_m20_impedance">
 
   <!-- ========================================================= -->
   <!-- Custom parameterized M20 bolt / nut SDF plugins             -->
@@ -208,7 +208,7 @@
             name="indy_joint1" 
             range="-3.05432619099 3.05432619099" 
             armature="4" 
-            damping="100"
+            damping="50"
             frictionloss="0"
         />
 
@@ -230,7 +230,7 @@
               name="indy_joint2" 
               range="-3.05432619099 3.05432619099" 
               armature="4" 
-              damping="100"
+              damping="150"
               frictionloss="0"
           />
 
@@ -252,7 +252,7 @@
                 name="indy_joint3" 
                 range="-3.05432619099 3.05432619099" 
                 armature="1" 
-                damping="50"
+                damping="100"
                 frictionloss="0"
             />
 
@@ -274,7 +274,7 @@
                   name="indy_joint4" 
                   range="-6.28318530718 6.28318530718"
                   armature="1" 
-                  damping="25"
+                  damping="50"
                   frictionloss="0"
               />
 
@@ -296,7 +296,7 @@
                     name="indy_joint5" 
                     range="-6.28318530718 6.28318530718"
                     armature="0.8" 
-                    damping="25"
+                    damping="20"
                     frictionloss="0.0"
                 />
 
@@ -318,7 +318,7 @@
                       name="indy_joint6" 
                       range="-16.5663706144 16.5663706144"
                       armature="0.8" 
-                      damping="15"
+                      damping="10"
                       frictionloss="0.0"
                   />
 
@@ -538,59 +538,69 @@
 
   </worldbody>
 
+  <!-- Impedance-control actuator setup:
+       - indy_joint1~6 use motor actuators and expect torque commands.
+       - gripper joints keep position actuators.
+  -->
   <actuator>
     <motor 
         name="indy_joint0_actuator" 
         joint="indy_joint1" 
         gear="1 0 0 0 0 0" 
-        ctrllimited="false" 
-        ctrlrange="-1e6 1e6" 
-        forcerange="-1e6 1e6"
+        ctrllimited="true" 
+        ctrlrange="-8000 8000" 
+        forcelimited="true"
+        forcerange="-8000 8000"
     />
 
     <motor 
         name="indy_joint1_actuator" 
         joint="indy_joint2" 
         gear="1 0 0 0 0 0" 
-        ctrllimited="false" 
-        ctrlrange="-1e6 1e6" 
-        forcerange="-1e6 1e6"
+        ctrllimited="true" 
+        ctrlrange="-8000 8000" 
+        forcelimited="true"
+        forcerange="-8000 8000"
     />
 
     <motor 
         name="indy_joint2_actuator" 
         joint="indy_joint3" 
         gear="1 0 0 0 0 0" 
-        ctrllimited="false" 
-        ctrlrange="-1e6 1e6" 
-        forcerange="-1e6 1e6"
+        ctrllimited="true" 
+        ctrlrange="-8000 8000" 
+        forcelimited="true"
+        forcerange="-8000 8000"
     />
 
     <motor 
         name="indy_joint3_actuator" 
         joint="indy_joint4" 
         gear="1 0 0 0 0 0" 
-        ctrllimited="false" 
-        ctrlrange="-1e6 1e6" 
-        forcerange="-1e6 1e6"
+        ctrllimited="true" 
+        ctrlrange="-9000 9000" 
+        forcelimited="true"
+        forcerange="-9000 9000"
     />
 
     <motor 
         name="indy_joint4_actuator" 
         joint="indy_joint5" 
         gear="1 0 0 0 0 0" 
-        ctrllimited="false" 
-        ctrlrange="-1e6 1e6" 
-        forcerange="-1e6 1e6"
+        ctrllimited="true" 
+        ctrlrange="-9000 9000" 
+        forcelimited="true"
+        forcerange="-9000 9000"
     />
 
     <motor 
         name="indy_joint5_actuator" 
         joint="indy_joint6" 
         gear="1 0 0 0 0 0" 
-        ctrllimited="false" 
-        ctrlrange="-1e6 1e6" 
-        forcerange="-1e6 1e6"
+        ctrllimited="true" 
+        ctrlrange="-7000 7000" 
+        forcelimited="true"
+        forcerange="-7000 7000"
     />
 
     <position 

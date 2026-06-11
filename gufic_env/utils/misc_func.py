@@ -332,8 +332,8 @@ def set_gains(controller = "GUFIC", task = "regulation", sim_mode = "demonstrati
             zeta_w = 10
         elif task in ["bolt"]:
             if sim_mode == "demonstration":
-                Kp = np.eye(3) * np.array([1000, 1000, 1000]) # demonstration
-                KR = np.eye(3) * np.array([1000, 1000, 1000])
+                Kp = np.eye(3) * np.array([2000, 2000, 2000]) # demonstration
+                KR = np.eye(3) * np.array([2000, 2000, 2000])
                 Kd = np.eye(6) * np.array([500, 500, 500, 500, 500, 500])
 
                 kp_force = 1.0
@@ -342,9 +342,20 @@ def set_gains(controller = "GUFIC", task = "regulation", sim_mode = "demonstrati
 
                 zeta_v = 50
                 zeta_w = 10
+            elif sim_mode == "smlovla_position_infer":
+                Kp = np.eye(3) * np.array([5000, 5000, 5000]) # infer
+                KR = np.eye(3) * np.array([5000, 5000, 5000])
+                Kd = np.eye(6) * np.array([500, 500, 500, 500, 500, 500])
+
+                kp_force = 1.0
+                kd_force = 0.0
+                ki_force = 4.0
+
+                zeta_v = 100
+                zeta_w = 100
             else:
-                Kp = np.eye(3) * np.array([1000, 1000, 1000]) # infer
-                KR = np.eye(3) * np.array([1000, 1000, 1000])
+                Kp = np.eye(3) * np.array([2000, 2000, 2000]) # infer
+                KR = np.eye(3) * np.array([2000, 2000, 2000])
                 Kd = np.eye(6) * np.array([500, 500, 500, 500, 500, 500])
 
                 kp_force = 1.0

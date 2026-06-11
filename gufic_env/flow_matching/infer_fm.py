@@ -14,7 +14,9 @@ from gufic_env.flow_matching.model import (
     VelocityFMTransformer,
     VelocityFMCondUnet1D,
     VisionDeltaPoseNet,
-    VisionDeltaPoseNetV2,
+    VisionPoseObsEncoder,
+    VisionPoseObsEncoderPoseSimpleV2,
+    VisionPoseObsEncoderNoPCForVelocity,
 )
 from gufic_env.flow_matching.config import TrainConfig
 
@@ -73,8 +75,14 @@ def load_model(ckpt_path, device="cuda"):
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    obs_encoder = VisionDeltaPoseNet(
+    # 按照 PointNet/obs_encoder 提条件，pose_model 用 Flow Matching 生成期望位姿的结构加载。
+    # obs_encoder.forward(pc, x_now, cond_hist) -> nx, guide_feat
+    obs_dim = int(getattr(cfg, "obs_dim", 128))
+
+    obs_encoder = VisionPoseObsEncoderNoPCForVelocity(
         state_dim=cfg.state_dim,
+        cond_dim=cfg.cond_dim,
+        obs_dim=obs_dim,
         guide_dim=cfg.guide_dim,
         embed_dim=cfg.embed_dim,
         input_channels=cfg.input_channels,
@@ -82,6 +90,24 @@ def load_model(ckpt_path, device="cuda"):
     ).to(device)
     obs_encoder.load_state_dict(ckpt["obs_encoder"])
     obs_encoder.eval()
+
+    if "pose_model" not in ckpt:
+        raise KeyError(
+            "Checkpoint 中没有 pose_model。请确认训练脚本已经保存 "
+            "'pose_model': pose_model.state_dict()。"
+        )
+
+    pose_model = VelocityFMTransformer(
+        x_dim=9,                 # [pd(3), Rd6d(6)]
+        cond_dim=obs_dim,        # nx 维度，必须和 VisionPoseObsEncoder 输出一致
+        guide_dim=cfg.guide_dim,
+        time_dim=cfg.time_dim,
+        hidden_dim=cfg.hidden_dim,
+        num_layers=cfg.num_layers,
+        use_cond=True,
+    ).to(device)
+    pose_model.load_state_dict(ckpt["pose_model"])
+    pose_model.eval()
 
     # 兼容两种命名：新版 cond_stats，旧版 stats
     stats = ckpt.get("cond_stats", None)
@@ -92,12 +118,32 @@ def load_model(ckpt_path, device="cuda"):
         raise ValueError("Checkpoint 中没有找到 cond_stats / stats。")
 
 
-    return model, obs_encoder, cfg, ckpt, stats
+    return model, obs_encoder, pose_model, cfg, ckpt, stats
 
 
 # ============================================================
 # Normalization helpers
 # ============================================================
+def recover_desired_pose_from_abs(desired_pose_pred_norm, stats):
+    desired_pose_pred_norm = np.asarray(
+        desired_pose_pred_norm,
+        dtype=np.float32,
+    ).reshape(9)
+
+    pd = denormalize_data(
+        desired_pose_pred_norm[:3][None, :],
+        stats,
+        "desired_p",
+    ).reshape(3)
+
+    Rd6d = denormalize_data(
+        desired_pose_pred_norm[3:][None, :],
+        stats,
+        "desired_R",
+    ).reshape(6)
+
+    Rd = rot6d_to_rotmat_np(Rd6d)
+    return pd.astype(np.float32), Rd.astype(np.float32)
 
 def normalize_data(data, stats, key="v"):
     return (data - stats[f"{key}_mean"]) / stats[f"{key}_std"]
@@ -115,6 +161,21 @@ def get_velocity_key(stats):
     if "vd_mean" in stats and "vd_std" in stats:
         return "vd"
     return "v"
+
+
+def pointcloud_cam_to_ee_batch(pc, R_ec, t_ec):
+    """
+    Eye-in-hand 点云从相机系直接变到末端系：
+        x_e = R_ec @ x_c + t_ec
+
+    这样和采样时的当前 p/R 无关，pc_hist_len > 1 时也不会把历史点云错用当前位姿变换。
+    """
+    pc = np.asarray(pc, dtype=np.float32)
+    xyz_cam = pc[..., :3]
+    R_ec = np.asarray(R_ec, dtype=np.float32).reshape(3, 3)
+    t_ec = np.asarray(t_ec, dtype=np.float32).reshape(3)
+    xyz_ee = np.einsum("ij,tpj->tpi", R_ec, xyz_cam) + t_ec.reshape(1, 1, 3)
+    return xyz_ee.astype(np.float32)
 
 
 # ============================================================
@@ -301,6 +362,7 @@ def get_velocity_field(g, pd, Rd, dpd, dRd, zeta_v=50.0, zeta_w=10.0):
 def sample_velocity_trajectory(
     model,
     obs_encoder,
+    pose_model,
     traj_len,
     stats,
     device="cuda",
@@ -328,7 +390,7 @@ def sample_velocity_trajectory(
 
     fe_cond = None
     guide_feat = None
-    delta_pose_pred_norm = None
+    desired_pose_pred_norm = None
 
     use_cond = bool(getattr(cfg, "use_cond", False)) if cfg is not None else False
 
@@ -360,19 +422,43 @@ def sample_velocity_trajectory(
         x_now = fe_cond[:, now_left:now_right]
 
         cond_pc = torch.from_numpy(cond_pc_np).to(device).float()
+        cond_pc = cond_pc.unsqueeze(0)  # [1, H, P, C] 或 [1, P, C]
 
-        # 与训练代码保持一致：如果训练时 pc_hist 是 [B,H,P,C]，这里就保留 [1,H,P,C]
-        # 如果 PointNet 实际要求 [B,P,C]，且 pc_hist_len=1，可以改成 cond_pc = cond_pc[0][None]
-        cond_pc = cond_pc.unsqueeze(0)
+        # obs_encoder 只编码条件，不直接预测位姿：
+        #   nx:         给 pose_model 作为 global condition
+        #   guide_feat: 给 velocity model 作为 FiLM guide
+        nx, guide_feat = obs_encoder(
+            cond_pc,
+            x_now,
+            cond_hist=fe_cond,
+        )
 
-        guide_feat, delta_pose_pred = obs_encoder(cond_pc, x_now)
-        # guide_feat, delta_pose_pred = obs_encoder(
-        #                                 cond_pc,
-        #                                 x_now,
-        #                                 cond_hist=fe_cond,
-        #                             )
-        delta_pose_pred_norm = (
-            delta_pose_pred.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        if pose_model is None:
+            raise ValueError("use_cond=True 时必须传入 pose_model。")
+
+        # 生成绝对期望位姿 [pd, Rd6d]，normalized space。
+        # 离线评估可以用随机初值；在线控制建议改成 zeros 或固定低通。
+        z_pose = torch.randn(1, 1, 9, device=device)
+
+        for i in range(steps):
+            t_pose = torch.full(
+                (1, 1, 1),
+                i / steps,
+                device=device,
+                dtype=z_pose.dtype,
+            )
+
+            u_pose = pose_model(
+                x_t=z_pose,
+                t=t_pose,
+                cond_main=nx,
+                guide=None,
+            )
+
+            z_pose = z_pose + u_pose * (1.0 / steps)
+
+        desired_pose_pred_norm = (
+            z_pose.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32)
         )  # [9]
 
     v_sample_history_norm = []
@@ -434,7 +520,7 @@ def sample_velocity_trajectory(
         "v_sample_final": v_sample_final,
         "v_sample_final_norm": v_sample_final_norm,
         "u_final_norm": u_final_norm,
-        "delta_pose_pred_norm": delta_pose_pred_norm,
+        "desired_pose_pred_norm": desired_pose_pred_norm,
         "v_sample_history": v_sample_history,
         "v_sample_history_norm": v_sample_history_norm,
         "u_history_norm": u_history_norm,
@@ -685,17 +771,16 @@ def run_direct_field_inference(
     os.makedirs(out_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model, obs_encoder, cfg, ckpt, stats = load_model(ckpt_path, device=device)
+    model, obs_encoder, pose_model, cfg, ckpt, stats = load_model(ckpt_path, device=device)
     demo = load_one_demo(demo_path)
 
     pd_pred_arr = None
     Rd_pred_arr = None
     pd_gt_arr = None
     Rd_gt_arr = None
-    if separation_vp:
-        vel_key="vd"
-    else:
-        vel_key="v"
+    vel_key = get_velocity_key(stats)
+    if separation_vp and vel_key != "vd":
+        raise ValueError("separation_vp=True，但 checkpoint stats 中没有 vd_mean/vd_std。")
 
     if cfg.train_mode == "fixed_length":
         v_gt = demo["v"]
@@ -710,6 +795,7 @@ def run_direct_field_inference(
         result = sample_velocity_trajectory(
             model=model,
             obs_encoder=obs_encoder,
+            pose_model=pose_model,
             traj_len=traj_len,
             stats=stats,
             device=device,
@@ -788,18 +874,10 @@ def run_direct_field_inference(
                 pad_pc = np.repeat(cond_pc[0:1], pad_len, axis=0)
                 cond_pc = np.concatenate([pad_pc, cond_pc], axis=0)
 
-            # 5. 点云转到当前末端系；保持与原始推理代码一致
-            p_now_raw_1 = demo["p"][i: i + 1].astype(np.float32)
-            R_now_raw_1 = demo["R"][i: i + 1].astype(np.float32)
-
-            pc_world = pointcloud_cam_to_world_batch(
-                cond_pc, p_now_raw_1, R_now_raw_1, R_ec, t_ec
-            )
-            pc_ee = np.einsum(
-                "tji,tpj->tpi",
-                R_now_raw_1,
-                pc_world[..., :3] - p_now_raw_1[:, None, :],
-            )
+            # 5. 点云转到末端系。
+            # Eye-in-hand 外参固定，camera -> ee 不需要依赖当前 p/R；
+            # 这样 pc_hist_len > 1 时历史点云也不会被当前位姿错误变换。
+            pc_ee = pointcloud_cam_to_ee_batch(cond_pc, R_ec, t_ec)
             pc_ee = pc_ee / 0.1
 
             cond_pc = np.stack(
@@ -809,7 +887,7 @@ def run_direct_field_inference(
 
             # 注意： Dataset 训练时点云缩放了两次，这里保持一致；
             # 如果修正了 Dataset 的重复缩放，这里也要同步去掉下面这一行。
-            cond_pc = (cond_pc / 0.1).astype(np.float32)
+            cond_pc = cond_pc.astype(np.float32)
 
             # 6. 条件拼接
             cond = np.concatenate(
@@ -819,6 +897,7 @@ def run_direct_field_inference(
             result = sample_velocity_trajectory(
                 model=model,
                 obs_encoder=obs_encoder,
+                pose_model=pose_model,
                 traj_len=traj_len,
                 stats=stats,
                 device=device,
@@ -831,15 +910,13 @@ def run_direct_field_inference(
                 vel_key=vel_key
             )
             if separation_vp:
-                # 7. VDP-Net 预测 delta pose -> 恢复预测期望位姿 pd/Rd
-                delta_pose_pred_norm = result["delta_pose_pred_norm"]
+                # 7. pose_model 生成的是绝对期望位姿 [pd, Rd6d]，不是局部 delta pose
+                desired_pose_pred_norm = result["desired_pose_pred_norm"]
                 p_now_raw = demo["p"][i].astype(np.float32)
                 R_now_raw = demo["R"][i].astype(np.float32)
 
-                p_des_pred, R_des_pred, delta_p_local, R_rel_pred = recover_pose_from_delta(
-                    p_now_raw=p_now_raw,
-                    R_now_raw=R_now_raw,
-                    delta_pose_pred_norm=delta_pose_pred_norm,
+                p_des_pred, R_des_pred = recover_desired_pose_from_abs(
+                    desired_pose_pred_norm=desired_pose_pred_norm,
                     stats=stats,
                 )
 
@@ -1021,8 +1098,8 @@ if __name__ == "__main__":
         out_dir = f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_insertion_vis_pRFe_{type}"
 
     elif robot_task == "bolt":
-        ckpt_path = f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_boltnut_vis_pRFe_{type}/cfm_transformer_{type}_best32.pt"
-        demo_path = "/home/zhou/autolab/GUFIC_mujoco-main/boltnut3_vis_demo/bolt_demo_0099.npz"
+        ckpt_path = f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_cfm_transformer_boltnut_vis_pRFe_{type}/cfm_transformer_{type}_best39.pt"
+        demo_path = "/home/zhou/autolab/GUFIC_mujoco-main/boltnut3_vis_demo/bolt_demo_0000.npz"
         out_dir = f"/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/infer_cfm_transformer_boltnut_vis_pRFe_{type}"
 
     else:

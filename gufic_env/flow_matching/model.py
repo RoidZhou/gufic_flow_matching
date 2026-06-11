@@ -281,6 +281,412 @@ class VisionDeltaPoseNet(nn.Module):
 
         return guide_feat, delta_pose_pred
  
+class VisionDeltaPoseFMTransformer(nn.Module):
+    """
+    用 PointNet + 条件编码器生成 guide_feat；
+    用 Flow Matching Transformer 生成 delta_pose_pred = [Δp(3), ΔR6d(6)]。
+
+    训练时:
+        forward(..., x_t=xt_pose, t=t_pose)
+        返回 guide_feat, delta_pose_flow_pred
+
+    推理时:
+        forward(..., x_t=None, t=None)
+        内部从高斯噪声采样 delta_pose_pred
+        返回 guide_feat, delta_pose_pred
+    """
+    def __init__(
+        self,
+        state_dim=9,
+        cond_dim=105,
+        guide_dim=16,
+        embed_dim=256,
+        input_channels=3,
+        input_transform=False,
+        time_dim=64,
+        hidden_dim=256,
+        num_layers=4,
+        nhead=8,
+        dropout=0.1,
+        sample_steps=10,
+    ):
+        super().__init__()
+
+        self.sample_steps = sample_steps
+        self.guide_dim = guide_dim
+
+        self.pointnet = PointNetBackbone(
+            embed_dim=embed_dim,
+            input_channels=input_channels,
+            input_transform=input_transform,
+        )
+
+        self.pc_proj = nn.Sequential(
+            nn.Linear(embed_dim, 256),
+            nn.Mish(),
+            nn.Linear(256, 128),
+            nn.Mish(),
+        )
+
+        self.state_proj = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.Mish(),
+            nn.Linear(128, 128),
+            nn.Mish(),
+        )
+
+        self.cond_proj = nn.Sequential(
+            nn.Linear(cond_dim, 256),
+            nn.Mish(),
+            nn.Linear(256, 128),
+            nn.Mish(),
+        )
+
+        self.fuse = nn.Sequential(
+            nn.Linear(128 + 128 + 128, 256),
+            nn.Mish(),
+            nn.Linear(256, 128),
+            nn.Mish(),
+        )
+
+        self.guide_proj = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.Mish(),
+            nn.Linear(64, guide_dim),
+        )
+
+        # 用同一个 VelocityFMTransformer 结构生成 delta_pose
+        # x_dim=9: Δp(3) + ΔR6d(6)
+        self.delta_fm = VelocityFMTransformer(
+            x_dim=9,
+            cond_dim=128,
+            guide_dim=guide_dim,
+            time_dim=time_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            use_cond=True,
+            nhead=nhead,
+            dropout=dropout,
+            max_seq_len=128,
+        )
+
+    def encode_condition(self, pc_now, x_now, cond_hist):
+        """
+        pc_now:    [B,P,3] 或 [B,H,P,3]
+        x_now:     [B,9]
+        cond_hist: [B,cond_dim]
+        """
+        pc_feat = self.pointnet(pc_now)     # [B,embed_dim]
+        pc_feat = self.pc_proj(pc_feat)     # [B,128]
+
+        x_feat = self.state_proj(x_now)     # [B,128]
+
+        if cond_hist is None:
+            cond_feat = torch.zeros_like(x_feat)
+        else:
+            cond_feat = self.cond_proj(cond_hist)
+
+        h = self.fuse(torch.cat([pc_feat, x_feat, cond_feat], dim=-1))  # [B,128]
+        guide_feat = self.guide_proj(h)                                 # [B,guide_dim]
+
+        return h, guide_feat
+
+    def forward(self, pc_now, x_now, cond_hist=None, x_t=None, t=None):
+        """
+        训练:
+            x_t, t 不为 None，返回 delta_pose 的 flow velocity 预测。
+
+        推理:
+            x_t, t 为 None，从噪声积分生成 delta_pose_pred。
+        """
+        cond_feat, guide_feat = self.encode_condition(pc_now, x_now, cond_hist)
+
+        # 训练模式：预测 flow velocity
+        if x_t is not None and t is not None:
+            delta_flow_pred = self.delta_fm(
+                x_t=x_t,
+                t=t,
+                cond_main=cond_feat,
+                guide=guide_feat,
+            )
+            return guide_feat, delta_flow_pred
+
+        # 推理模式：从 N(0,I) 采样 delta_pose
+        B = x_now.shape[0]
+        device = x_now.device
+        z = torch.randn(B, 9, device=device, dtype=x_now.dtype)
+
+        dt = 1.0 / float(self.sample_steps)
+
+        for i in range(self.sample_steps):
+            tau = torch.full(
+                (B, 1),
+                i / float(self.sample_steps),
+                device=device,
+                dtype=x_now.dtype,
+            )
+
+            u = self.delta_fm(
+                x_t=z,
+                t=tau,
+                cond_main=cond_feat,
+                guide=guide_feat,
+            )
+
+            z = z + u * dt
+
+        delta_pose_pred = z
+        return guide_feat, delta_pose_pred
+
+class VisionPoseObsEncoder(nn.Module):
+    def __init__(
+        self,
+        state_dim=9,
+        cond_dim=105,
+        obs_dim=128,
+        guide_dim=16,
+        embed_dim=256,
+        input_channels=3,
+        input_transform=False,
+    ):
+        super().__init__()
+
+        self.pointnet = PointNetBackbone(
+            embed_dim=embed_dim,
+            input_channels=input_channels,
+            input_transform=input_transform,
+        )
+
+        self.pc_proj = nn.Sequential(
+            nn.Linear(embed_dim, 256),
+            nn.Mish(),
+            nn.Linear(256, obs_dim),
+            nn.Mish(),
+        )
+
+        self.state_proj = nn.Sequential(
+            nn.Linear(state_dim, obs_dim),
+            nn.Mish(),
+            nn.Linear(obs_dim, obs_dim),
+            nn.Mish(),
+        )
+
+        self.cond_proj = nn.Sequential(
+            nn.Linear(cond_dim, 256),
+            nn.Mish(),
+            nn.Linear(256, obs_dim),
+            nn.Mish(),
+        )
+
+        self.fuse = nn.Sequential(
+            nn.Linear(obs_dim * 3, 256),
+            nn.Mish(),
+            nn.Linear(256, obs_dim),
+            nn.Mish(),
+        )
+
+        # pose FM 的条件特征
+        self.pose_cond_proj = nn.Sequential(
+            nn.Linear(obs_dim, obs_dim),
+            nn.Mish(),
+            nn.Linear(obs_dim, obs_dim),
+            nn.Mish(),
+        )
+
+        # velocity FM 的视觉 guide
+        self.vel_guide_proj = nn.Sequential(
+            nn.Linear(obs_dim, 64),
+            nn.Mish(),
+            nn.Linear(64, guide_dim),
+        )
+
+    def forward(self, pc_now, x_now, cond_hist=None):
+        """
+        pc_now:    [B,P,3] 或 [B,H,P,3]
+        x_now:     [B,9]
+        cond_hist: [B,cond_dim]
+
+        return:
+            nx_pose:   [B, obs_dim]    给 pose_model 用
+            guide_vel: [B, guide_dim]  给 velocity_model 用
+        """
+
+        # 如果输入是历史点云 [B,H,P,C]，只取当前帧
+        pc_feat = self.pointnet(pc_now)      # [B, embed_dim]
+        pc_feat = self.pc_proj(pc_feat)      # [B, obs_dim]
+
+        x_feat = self.state_proj(x_now)      # [B, obs_dim]
+
+        if cond_hist is None:
+            cond_feat = torch.zeros_like(x_feat)
+        else:
+            cond_feat = self.cond_proj(cond_hist)  # [B, obs_dim]
+
+        h = self.fuse(
+            torch.cat([pc_feat, x_feat, cond_feat], dim=-1)
+        )
+
+        nx_pose = h
+        guide_vel = self.vel_guide_proj(h)
+
+        return nx_pose, guide_vel
+
+class VisionPoseObsEncoderPoseSimpleV2(nn.Module):
+    def __init__(
+        self,
+        state_dim=9,
+        cond_dim=105,
+        obs_dim=128,
+        guide_dim=16,
+        embed_dim=256,
+        input_channels=3,
+        input_transform=False,
+        dropout=0.05,
+    ):
+        super().__init__()
+
+        self.pointnet = PointNetBackbone(
+            embed_dim=embed_dim,
+            input_channels=input_channels,
+            input_transform=input_transform,
+        )
+
+        # =========================
+        # pose branch
+        # 只用于 pose_model 生成 pd, Rd
+        # 不直接使用力历史
+        # =========================
+        self.pose_pc_proj = nn.Linear(embed_dim, obs_dim)
+        self.pose_state_proj = nn.Linear(state_dim, obs_dim)
+        self.pose_norm = nn.LayerNorm(obs_dim)
+
+        # =========================
+        # velocity branch
+        # 用于生成 velocity guide
+        # 可以使用点云 + 当前状态 + p/R/Fe 历史
+        # =========================
+        self.vel_pc_proj = nn.Linear(embed_dim, obs_dim)
+        self.vel_state_proj = nn.Linear(state_dim, obs_dim)
+        self.vel_cond_proj = nn.Linear(cond_dim, obs_dim)
+
+        self.vel_guide_proj = nn.Sequential(
+            nn.Linear(obs_dim * 3, 128),
+            nn.LayerNorm(128),
+            nn.Mish(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.Mish(),
+            nn.Linear(64, guide_dim),
+        )
+
+        self.act = nn.Mish()
+
+    def forward(self, pc_now, x_now, cond_hist=None):
+        """
+        pc_now:    [B,P,3] 或 [B,H,P,3]
+        x_now:     [B,9]
+        cond_hist: [B,cond_dim]
+
+        return:
+            nx_pose:   [B, obs_dim]    给 pose_model 用
+            guide_vel: [B, guide_dim]  给 velocity_model 用
+        """
+
+        pc_global = self.pointnet(pc_now)  # [B, embed_dim]
+
+        # =====================================================
+        # 1. pose condition: only point cloud + current state
+        # =====================================================
+        pose_pc = self.pose_pc_proj(pc_global)
+        pose_x = self.pose_state_proj(x_now)
+
+        nx_pose = self.act(
+            self.pose_norm(pose_pc + pose_x)
+        )  # [B, obs_dim]
+
+        # =====================================================
+        # 2. velocity guide: point cloud + current state + history
+        # =====================================================
+        vel_pc = self.vel_pc_proj(pc_global)
+        vel_x = self.vel_state_proj(x_now)
+
+        if cond_hist is None:
+            vel_cond = torch.zeros_like(vel_x)
+        else:
+            vel_cond = self.vel_cond_proj(cond_hist)
+
+        h_vel = torch.cat([vel_pc, vel_x, vel_cond], dim=-1)  # [B, 3*obs_dim]
+        guide_vel = self.vel_guide_proj(h_vel)                # [B, guide_dim]
+
+        return nx_pose, guide_vel
+    
+
+class VisionPoseObsEncoderNoPCForVelocity(nn.Module):
+    def __init__(
+        self,
+        state_dim=9,
+        cond_dim=105,
+        obs_dim=128,
+        guide_dim=16,
+        embed_dim=256,
+        input_channels=3,
+        input_transform=False,
+        dropout=0.0,
+    ):
+        super().__init__()
+
+        self.pointnet = PointNetBackbone(
+            embed_dim=embed_dim,
+            input_channels=input_channels,
+            input_transform=input_transform,
+        )
+
+        # pose branch: PointNet + x_now
+        self.pose_pc_proj = nn.Linear(embed_dim, obs_dim)
+        self.pose_state_proj = nn.Linear(state_dim, obs_dim)
+        self.pose_norm = nn.LayerNorm(obs_dim)
+
+        # velocity guide branch: 不使用 PointNet，只用 x_now + cond_hist
+        self.vel_state_proj = nn.Linear(state_dim, obs_dim)
+        self.vel_cond_proj = nn.Linear(cond_dim, obs_dim)
+
+        self.vel_guide_proj = nn.Sequential(
+            nn.Linear(obs_dim * 2, 128),
+            nn.LayerNorm(128),
+            nn.Mish(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.Mish(),
+            nn.Linear(64, guide_dim),
+        )
+
+        self.act = nn.Mish()
+
+    def forward(self, pc_now, x_now, cond_hist=None):
+        # ======================
+        # pose branch uses PointNet
+        # ======================
+        pc_global = self.pointnet(pc_now)
+
+        pose_pc = self.pose_pc_proj(pc_global)
+        pose_x = self.pose_state_proj(x_now)
+
+        nx_pose = self.act(self.pose_norm(pose_pc + pose_x))
+
+        # ======================
+        # velocity branch does NOT use PointNet
+        # ======================
+        vel_x = self.vel_state_proj(x_now)
+
+        if cond_hist is None:
+            vel_cond = torch.zeros_like(vel_x)
+        else:
+            vel_cond = self.vel_cond_proj(cond_hist)
+
+        h_vel = torch.cat([vel_x, vel_cond], dim=-1)
+        guide_vel = self.vel_guide_proj(h_vel)
+
+        return nx_pose, guide_vel
 # ============================================================
 # Flow Matching Conditional Unet1D version
 # 输入:

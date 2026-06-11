@@ -111,7 +111,7 @@ class RobotEnv:
         model='mlp',
         max_time=20,
         show_viewer=False,
-        fz=5,
+        fz=10,
         observables=None,
         fix_camera=False,
         task='regulation',
@@ -145,6 +145,7 @@ class RobotEnv:
         smolvla_contact_force_threshold=1.0,
         smolvla_reset_each_update=True,
         smolvla_ablation_mode=True,
+        sim_mode="demonstration",
     ):
         self.robot_name = robot_name
         self.task = task
@@ -171,7 +172,7 @@ class RobotEnv:
         self.smolvla_reset_each_update = bool(smolvla_reset_each_update)
         self.smolvla_ablation_mode = bool(smolvla_ablation_mode)
         self.smolvla_infer = None
-
+        self.sim_mode = sim_mode
         if observables is not None:
             self.observables = observables
         else:
@@ -276,7 +277,7 @@ class RobotEnv:
         self.Fe = np.zeros((6, 1))
         self.reset()
 
-        self.Kp, self.KR, self.Kd, self.kp_force, self.kd_force, self.ki_force, self.zeta_v, self.zeta_w = set_gains(controller = 'GUFIC', task = self.task, sim_mode = "infer")
+        self.Kp, self.KR, self.Kd, self.kp_force, self.kd_force, self.ki_force, self.zeta_v, self.zeta_w = set_gains(controller = 'GUFIC', task = self.task, sim_mode = self.sim_mode)
 
 
         self.int_sat = 5
@@ -1551,9 +1552,9 @@ class RobotEnv:
         else:
             Vd_star, dVd_star = self.get_velocity_field(g, Vb.reshape((-1,)), t=current_t)
 
-        contact = abs(float(Fe[2])) > 1.0
-        if contact:
-            Kp = np.eye(3) * np.array([500, 500, 500]) # infer
+        # contact = abs(float(Fe[2])) > 1.0
+        # if contact:
+        #     Kp = np.eye(3) * np.array([500, 500, 500]) # infer
         # else:
         #     Vd_star[0:3] = np.clip(Vd_star[0:3], -0.4, 0.4)
 
