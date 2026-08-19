@@ -1,8 +1,7 @@
 import argparse
-import copy
 import types
 from pathlib import Path
-
+import copy
 import numpy as np
 import torch
 
@@ -148,6 +147,10 @@ def unpack_pi0_action(action):
     return pd, Rd, Vd_body, dpd, dRd
 
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> 8660058 (update visual_cfm)
 class PI0VelocityFieldInfer:
     """
     Use a fine-tuned pi0 policy to predict:
@@ -457,7 +460,6 @@ def print_result(name, result):
     print("dRd:\n", result["dRd"])
     if "Vd_star" in result:
         print("Vd_star:", result["Vd_star"])
-
 
 def rotation_geodesic_error_deg(R_pred, R_gt):
     R_pred = np.asarray(R_pred, dtype=np.float32).reshape(-1, 3, 3)
@@ -806,11 +808,11 @@ def parse_args():
     )
     parser.add_argument(
         "--policy_path",
-        default="/media/zhou/Elements SE/VLA/checkpoints_pi0/checkpoints/001000/pretrained_model",
+        default="/root/autodl-tmp/checkpoints_smolvla_v4/checkpoints/002000/pretrained_model",
     )
     parser.add_argument(
         "--dataset_root",
-        default="/media/zhou/Elements SE/VLA/boltnut3_pi0_lerobot_random_start",
+        default="/root/autodl-tmp/boltnut_pi0_lerobot_20HZ",
         help="LeRobot dataset root used for metadata/stats and optional frame test.",
     )
     parser.add_argument("--dataset_repo_id", default="gufic_boltnut_pi0")
@@ -819,25 +821,24 @@ def parse_args():
     parser.add_argument("--device", default=None)
     parser.add_argument("--zeta_v", type=float, default=50.0)
     parser.add_argument("--zeta_w", type=float, default=10.0)
+    parser.add_argument("--save_npz", default="/root/vla/gufic_flow_matching/gufic_env/flow_matching/infer_pi0")
     parser.add_argument(
         "--action_mode",
-        default="pose",
+        default="full",
         choices=["pose", "full"],
         help="Use 'pose' for [pd,Rd6d] checkpoints, or 'full' for [pd,Rd6d,Vd_body].",
     )
-    parser.add_argument("--save_npz", default=None)
     parser.add_argument(
         "--compare",
-        action="store_true",
-        help="Run multi-frame dataset comparison and save plots instead of only printing one frame.",
+        default=True,
     )
     parser.add_argument(
         "--out_dir",
-        default="./infer_pi0_compare",
+        default="./infer_pi0_compare_v3",
         help="Output directory for --compare plots.",
     )
     parser.add_argument("--start_index", type=int, default=0)
-    parser.add_argument("--max_frames", type=int, default=1000)
+    parser.add_argument("--max_frames", type=int, default=12000)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument(
         "--keep_action_queue",
@@ -876,7 +877,6 @@ def main():
             zeta_v=args.zeta_v,
             zeta_w=args.zeta_w,
             save_npz=args.save_npz,
-            action_mode=args.action_mode,
         )
 
 
