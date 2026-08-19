@@ -1,9 +1,7 @@
 import argparse
 import copy
-import json
 import os
 import types
-from dataclasses import fields
 from pathlib import Path
 
 import numpy as np
@@ -40,11 +38,11 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 
 DEFAULT_SMOLVLA_POLICY_PATHS = (
-    "/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/"
+    "/root/vla/gufic_flow_matching/gufic_env/flow_matching/"
     "checkpoints_smolvla_boltnut/checkpoints/last/pretrained_model",
 )
 DEFAULT_SMOLVLM_PATHS = (
-    "/home/zhou/.cache/huggingface/hub/"
+    "/root/autodl-tmp/hub/"
     "models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct/snapshots/7b375e1b73b11138ff12fe22c8f2822d8fe03467",
 )
 
@@ -116,41 +114,6 @@ def patch_action_features_for_mode(features, stats, action_mode):
     return features, stats
 
 
-def load_smolvla_config(policy_path, device, vlm_model_name):
-    from lerobot.common.policies.smolvla.configuration_smolvla import SmolVLAConfig
-    from lerobot.configs.policies import PreTrainedConfig
-
-    try:
-        config = PreTrainedConfig.from_pretrained(str(policy_path))
-    except Exception as exc:
-        train_config_path = Path(policy_path) / "train_config.json"
-        if not train_config_path.exists():
-            raise RuntimeError(
-                f"Failed to parse SmolVLA config from {policy_path}, and train_config.json was not found."
-            ) from exc
-
-        with open(train_config_path, "r", encoding="utf-8") as f:
-            train_config = json.load(f)
-        policy_config = train_config.get("policy", {})
-        if policy_config.get("type") != "smolvla":
-            raise RuntimeError(
-                f"train_config.json does not contain a SmolVLA policy config: {train_config_path}"
-            ) from exc
-
-        valid_fields = {field.name for field in fields(SmolVLAConfig)}
-        skip_fields = {"type", "input_features", "output_features", "normalization_mapping"}
-        kwargs = {
-            key: value
-            for key, value in policy_config.items()
-            if key in valid_fields and key not in skip_fields
-        }
-        config = SmolVLAConfig(**kwargs)
-
-    config.vlm_model_name = vlm_model_name
-    config.device = device
-    return config
-
-
 class SmolVLAVelocityFieldInfer:
     """
     Use a fine-tuned SmolVLA policy to predict:
@@ -194,6 +157,7 @@ class SmolVLAVelocityFieldInfer:
         from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
         from lerobot.common.datasets.utils import dataset_to_policy_features
         from lerobot.common.policies.smolvla.modeling_smolvla import SmolVLAPolicy, pad_vector
+        from lerobot.configs.policies import PreTrainedConfig
         from lerobot.configs.types import FeatureType
 
         metadata = LeRobotDatasetMetadata(self.dataset_repo_id, root=self.dataset_root)
@@ -203,7 +167,9 @@ class SmolVLAVelocityFieldInfer:
             self.action_mode,
         )
 
-        config = load_smolvla_config(self.policy_path, self.device, self.vlm_model_name)
+        config = PreTrainedConfig.from_pretrained(str(self.policy_path))
+        config.vlm_model_name = self.vlm_model_name
+        config.device = self.device
 
         policy_features = dataset_to_policy_features(features)
         config.input_features = {
@@ -326,7 +292,7 @@ class SmolVLAVelocityFieldInfer:
         }
 
     @torch.no_grad()
-    def predict_velocity_field(self, wrist_image, external_image, p, R, Fe, ablation_mode=False, dpd=None, dRd=None):
+    def predict_velocity_field(self, wrist_image, external_image, p, R, Fe):
         result = self.predict_desired_motion(
             wrist_image=wrist_image,
             external_image=external_image,
@@ -339,9 +305,6 @@ class SmolVLAVelocityFieldInfer:
         g[:3, :3] = np.asarray(R, dtype=np.float32).reshape(3, 3)
         g[:3, 3] = np.asarray(p, dtype=np.float32).reshape(3)
 
-        if ablation_mode:
-            result["dpd"] = np.zeros(3, dtype=np.float32)
-            result["dRd"] = np.zeros((3,3), dtype=np.float32)
         result["Vd_star"] = get_velocity_field(
             g=g,
             pd=result["pd"],
@@ -621,7 +584,7 @@ def parse_args():
     )
     parser.add_argument(
         "--policy_path",
-        default="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_smolvla/checkpoints/020000/pretrained_model",
+        default="/root/autodl-tmp/checkpoints_smolvla_v2/checkpoints/005000/pretrained_model",
         help="Path to SmolVLA pretrained_model directory. Defaults to SMOLVLA_POLICY_PATH or local checkpoints.",
     )
     parser.add_argument(
@@ -631,10 +594,10 @@ def parse_args():
     )
     parser.add_argument(
         "--dataset_root",
-        default="/media/zhou/Elements SE/VLA/boltnut3_pi0_lerobot_random_start",
+        default="/root/autodl-tmp/boltnut_pi0_lerobot_20HZ",
         help="LeRobot dataset root used for metadata/stats and optional frame test.",
     )
-    parser.add_argument("--dataset_repo_id", default="gufic_boltnut_pi0")
+    parser.add_argument("--dataset_repo_id", default="gufic_boltnut_smolvla")
     parser.add_argument("--frame_index", type=int, default=0)
     parser.add_argument("--language", default="insert the bolt into the hole")
     parser.add_argument("--device", default=None)
@@ -653,7 +616,7 @@ def parse_args():
     )
     parser.add_argument("--out_dir", default="./infer_smolvla_compare")
     parser.add_argument("--start_index", type=int, default=0)
-    parser.add_argument("--max_frames", type=int, default=1000)
+    parser.add_argument("--max_frames", type=int, default=360)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument(
         "--keep_action_queue",
