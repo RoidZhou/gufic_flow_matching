@@ -1,21 +1,39 @@
 dataset:
   repo_id: gufic_boltnut_pi0
-  root: /media/zhou/Elements SE/VLA/boltnut3_pi0_lerobot_random_start
+  root: /root/autodl-tmp/ur5_rg2_real_smolvla_dataset_force_keyturning
+  revision: main
 
 policy:
   type: pi0
   chunk_size: 10
   n_action_steps: 10
-  device: cuda
+  effort_type: expert_his_c
+  effort_key: observation.force_torque
+  effort_dim: 6
+  effort_tokenizer: raw
+
+  force_refine_enabled: true
+  force_expert_enabled: true
+  train_force_expert: true
+  force_shared_attention_enabled: false
+
+  force_refine_split_step: 6
+  force_refine_loss_weight: 0.02
+
+  force_prediction_enabled: true
+  force_prediction_target_key: future.force_torque
+  force_prediction_loss_weight: 0.2
+  force_prediction_expert_enabled: true
+  force_prediction_effort_type: expert_his_c
 
 save_checkpoint: true
-output_dir: /home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/checkpoints_pi0_boltnut
-batch_size: 2
+output_dir: /root/autodl-tmp/checkpoints_pi0_hybrid_force_position_FR-VLA_keyturning_frl.02
+batch_size: 8
 job_name: pi0_boltnut
 resume: false
 seed: 42
 num_workers: 2
-steps: 20000
+steps: 40000
 eval_freq: -1
 log_freq: 50
 save_freq: 5000

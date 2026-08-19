@@ -1,0 +1,44 @@
+dataset:
+  repo_id: gufic_boltnut_smolvla
+  root: /root/autodl-tmp/ur5_rg2_real_smolvla_dataset_force_keyturning
+
+policy:
+  type: smolvla
+  chunk_size: 10
+  n_action_steps: 10
+
+  # 原始 SmolVLA：不使用力
+  effort_type: none
+  effort_tokenizer: raw
+  train_effort_proj: false
+
+  force_refine_enabled: false
+  force_expert_enabled: false
+  train_force_expert: false
+  force_shared_attention_enabled: false
+
+  force_refine_loss_weight: 0.0
+
+  force_prediction_enabled: false
+  force_prediction_loss_weight: 0.0
+  force_prediction_expert_enabled: false
+  train_force_prediction_expert: false
+
+save_checkpoint: true
+output_dir: /root/autodl-tmp/checkpoints_smolvla_keyturning
+job_name: smolvla_keyturning_wo_force
+resume: false
+seed: 42
+batch_size: 16
+num_workers: 2
+steps: 50000
+eval_freq: -1
+log_freq: 50
+save_freq: 5000
+use_policy_training_preset: true
+
+wandb:
+  enable: false
+  project: smolvla_boltnut
+  entity: ""
+  disable_artifact: true

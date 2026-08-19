@@ -8,12 +8,13 @@ from contextlib import nullcontext
 from pathlib import Path
 from pprint import pformat
 from typing import Any
-
+import copy
+import os
 import torch
 from termcolor import colored
 from torch.amp import GradScaler
 from torch.optim import Optimizer
-
+import argparse
 from lerobot.common.datasets.factory import make_dataset
 from lerobot.common.datasets.sampler import EpisodeAwareSampler
 from lerobot.common.datasets.utils import cycle
@@ -48,23 +49,30 @@ except ModuleNotFoundError:
     lerobot_make_optimizer_and_scheduler = None
 
 DEFAULT_PI0_PATH = (
-    "/home/zhou/.cache/huggingface/hub/"
+    "/root/autodl-tmp/hub/"
     "models--lerobot--pi0/snapshots/e4ed526af508e58f6008b29e9e48f1098278fdb5"
 )
+
+DEFAULT_PI0_PATHS = (
+    "/root/autodl-tmp/hub/"
+    "paligemma-3b-pt-224"
+)
 DEFAULT_SMOLVLM_PATHS = (
-    "/home/zhou/.cache/huggingface/hub/"
+    "/root/autodl-tmp/hub/"
     "models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct/snapshots/7b375e1b73b11138ff12fe22c8f2822d8fe03467"
 )
 DEFAULT_SMOLVLA_PATH = (
-    "/home/zhou/.cache/huggingface/hub/"
+    "/root/autodl-tmp/hub/"
     "models--lerobot--smolvla_base/snapshots/c83c3163b8ca9b7e67c509fffd9121e66cb96205"
 )
 
 def maybe_set_pretrained_path(cfg: TrainPipelineConfig) -> None:
     if cfg.policy.type == "pi0" and not getattr(cfg.policy, "pretrained_path", None):
         cfg.policy.pretrained_path = DEFAULT_PI0_PATH
+        cfg.policy.vlm_model_name = DEFAULT_PI0_PATHS
     elif cfg.policy.type == "smolvla" and not getattr(cfg.policy, "pretrained_path", None):
         cfg.policy.pretrained_path = DEFAULT_SMOLVLA_PATH
+        cfg.policy.vlm_model_name = DEFAULT_SMOLVLM_PATHS
 
 def log_runtime_paths() -> None:
     try:
@@ -107,6 +115,89 @@ def validate_dataset_root(cfg: TrainPipelineConfig) -> None:
             "Missing meta/episodes.jsonl. This usually means add_frame() wrote images, "
             "but save_episode() was not executed successfully. Re-collect into a new "
             "dataset directory, or remove/rename this partial directory before collecting."
+        )
+    validate_parquet_files(dataset_root)
+
+
+def validate_parquet_files(dataset_root: Path) -> None:
+    data_dir = dataset_root / "data"
+    if not data_dir.exists():
+        raise FileNotFoundError(
+            "Incomplete LeRobot dataset root: "
+            f"{dataset_root}\n"
+            "Missing data/ directory."
+        )
+
+    parquet_paths = sorted(data_dir.rglob("*.parquet"))
+    if not parquet_paths:
+        raise FileNotFoundError(
+            "No parquet episode files found under "
+            f"{data_dir}. Check dataset.root / dataset.repo_id."
+        )
+
+    bad_files = []
+    for parquet_path in parquet_paths:
+        try:
+            size = parquet_path.stat().st_size
+            with parquet_path.open("rb") as f:
+                head = f.read(4)
+                if size >= 4:
+                    f.seek(-4, os.SEEK_END)
+                    tail = f.read(4)
+                else:
+                    tail = b""
+        except OSError as exc:
+            bad_files.append((parquet_path, f"read failed: {exc}"))
+            continue
+
+        if size < 8:
+            bad_files.append((parquet_path, f"too small ({size} bytes)"))
+        elif head != b"PAR1" or tail != b"PAR1":
+            bad_files.append((parquet_path, "missing parquet PAR1 magic bytes"))
+
+    if bad_files:
+        details = "\n".join(f"  - {path}: {reason}" for path, reason in bad_files[:20])
+        if len(bad_files) > 20:
+            details += f"\n  ... and {len(bad_files) - 20} more"
+        raise RuntimeError(
+            "Corrupted or non-parquet episode files were found before training:\n"
+            f"{details}\n"
+            "Fix by deleting/re-collecting these episodes or restoring them from a "
+            "complete copy. The original pyarrow error is usually: "
+            "'Parquet magic bytes not found in footer'."
+        )
+
+
+def log_smolvla_force_config(cfg: TrainPipelineConfig, dataset) -> None:
+    policy_cfg = getattr(cfg, "policy", None)
+    if policy_cfg is None or getattr(policy_cfg, "type", None) != "smolvla":
+        return
+
+    effort_type = getattr(policy_cfg, "effort_type", "none")
+    effort_tokenizer = getattr(policy_cfg, "effort_tokenizer", "raw")
+    effort_key = getattr(policy_cfg, "effort_key", None)
+    if effort_type in {"none", "no"}:
+        return
+
+    logging.info(
+        "SmolVLA force config: "
+        f"effort_key={effort_key}, effort_type={effort_type}, "
+        f"effort_tokenizer={effort_tokenizer}"
+    )
+    if effort_key not in dataset.meta.features:
+        raise KeyError(
+            f"Configured effort_key {effort_key!r} is not in dataset features. "
+            f"Available features: {list(dataset.meta.features)}"
+        )
+
+    if effort_tokenizer == "force_vqvae":
+        ckpt = Path(getattr(policy_cfg, "force_vqvae_ckpt", "")).expanduser()
+        if not ckpt.is_file():
+            raise FileNotFoundError(f"policy.force_vqvae_ckpt does not exist: {ckpt}")
+        logging.info(
+            "SmolVLA force VQ-VAE enabled: "
+            f"ckpt={ckpt}, window={getattr(policy_cfg, 'force_vqvae_window', None)}, "
+            f"force_refine_enabled={getattr(policy_cfg, 'force_refine_enabled', False)}"
         )
 
 def make_optimizer_and_scheduler_compat(cfg: TrainPipelineConfig, policy: PreTrainedPolicy):
@@ -199,8 +290,7 @@ def train(cfg: TrainPipelineConfig):
     logging.info("Creating dataset")
     validate_dataset_root(cfg)
     dataset = make_dataset(cfg)
-    cfg.policy.vlm_model_name = DEFAULT_SMOLVLM_PATHS
-
+    log_smolvla_force_config(cfg, dataset)
     eval_env = None
     if cfg.eval_freq > 0 and cfg.env is not None:
         logging.info("Creating env")
@@ -358,10 +448,14 @@ def parse_args():
     )
     parser.add_argument(
         "--config_path",
-        default="/home/zhou/autolab/GUFIC_mujoco-main/gufic_env/flow_matching/smolvla_boltnut.yaml",
+        default="/root/vla/gufic_flow_matching/gufic_env/flow_matching/smolvla_boltnut.yaml",
         help="pi0_boltnut.yaml or smolvla_boltnut.yaml.",
     )
-
+    parser.add_argument(
+        "--resume",
+        default=False,
+        help="pi0_boltnut.yaml or smolvla_boltnut.yaml.",
+    )
     return parser.parse_args()
 
 if __name__ == "__main__":
